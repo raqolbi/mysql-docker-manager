@@ -87,6 +87,9 @@ Catatan:
 11. Lihat MySQL logs
 12. Ganti password user/root
 13. Auto backup & Cloudflare R2
+14. Hapus database + user
+15. Rotasi sertifikat SSL
+16. Uninstall instance (hapus container, opsional data)
  0. Keluar
 ```
 
@@ -200,6 +203,9 @@ Menu **13. Auto backup & Cloudflare R2**:
   5. Atur kredensial Cloudflare R2
   6. Tes koneksi R2
   7. Lihat & download backup dari R2
+  8. Atur notifikasi Telegram
+  9. Tes notifikasi Telegram
+ 10. Matikan notifikasi Telegram
 ```
 
   Parameter       Default   Keterangan
@@ -353,6 +359,97 @@ password baru (kosong = otomatis), lalu ketik `GANTI`.
 > Jangan mengganti password hanya dengan mengedit `.env`: nilainya hanya dipakai
 > saat inisialisasi pertama. Selalu gunakan menu 12.
 
+## Hapus database + user
+
+Menu **14**. Langkah:
+
+1.  Pilih database dari daftar.
+2.  Script menampilkan jumlah koneksi aktif dan user/role terkait. Jika ada
+    koneksi aktif, Anda diminta setuju memutusnya (jika tidak, dibatalkan).
+3.  Pilih apakah user/role yang **hanya** dipakai untuk database ini ikut
+    dihapus (default: ya).
+4.  Backup database dulu (default: ya) ke `backups/`.
+5.  Ketik ulang **nama database** untuk konfirmasi.
+
+Detail MySQL:
+
+-   Database sistem (`mysql`, `information_schema`, `performance_schema`,
+    `sys`) tidak bisa dihapus.
+-   User **khusus** = selain `USAGE`, haknya hanya ke database ini → ditawarkan
+    untuk dihapus. User yang juga punya akses ke database lain tidak dihapus;
+    hanya hak ke database ini yang dicabut.
+-   MySQL tidak mencabut grant saat database dihapus. Script mencabutnya
+    (`REVOKE`) supaya database baru dengan nama sama tidak otomatis bisa
+    diakses user lama.
+-   Koneksi aktif diputus dengan `KILL`.
+
+## Rotasi sertifikat SSL
+
+Menu **15** menampilkan sertifikat yang sedang dipakai (subject, issuer,
+tanggal berakhir, sisa hari), lalu:
+
+  Pilihan   Fungsi
+  --------- ----------------------------------------------------------------------
+  1         Buat sertifikat self-signed baru (berlaku 10 tahun)
+  2         Pakai sertifikat sendiri (mis. dari CA / Let's Encrypt): fullchain + key
+
+Untuk pilihan 2, script memastikan file berformat PEM, key tidak ber-passphrase,
+key **cocok** dengan sertifikat, dan sertifikat belum kedaluwarsa.
+
+-   Sertifikat lama disimpan di `backups/ssl-YYYYMMDD-HHMMSS/`.
+-   Sertifikat baru dimuat **tanpa restart**.
+-   Jika server menolak sertifikat baru, file lama otomatis dikembalikan dan
+    server tetap memakai sertifikat sebelumnya.
+-   Bagian atas menu menampilkan **peringatan** jika sertifikat berakhir dalam
+    kurang dari 30 hari (atau sudah kedaluwarsa); peringatan yang sama ikut
+    dikirim di notifikasi Telegram.
+
+Lokasi sertifikat: `data/ca.pem`, `data/server-cert.pem`, `data/server-key.pem` (dibuat otomatis oleh MySQL saat setup). Pilihan 1 membuat CA baru + sertifikat server yang ditandatangani CA tersebut; klien yang memakai `VERIFY_CA` perlu `ca.pem` yang baru. Pilihan 2 boleh menyertakan file CA/chain, atau mempertahankan `ca.pem` lama. Dimuat dengan `ALTER INSTANCE RELOAD TLS`.
+
+## Notifikasi Telegram
+
+Menu **13 → 8** (auto backup & R2):
+
+1.  Buat bot lewat **@BotFather** → dapatkan token (`123456:ABC...`).
+2.  Kirim pesan ke bot (atau tambahkan bot ke grup), lalu ambil chat ID dari
+    `https://api.telegram.org/bot<TOKEN>/getUpdates` (field `chat.id`; grup
+    biasanya diawali `-100`).
+3.  Isi token, chat ID, dan kapan dikirim: **hanya jika gagal** (default) atau
+    **setiap auto backup**. Pesan tes langsung dikirim.
+
+Isi pesan: status (✅/❌), host, folder, container, ringkasan per database,
+status upload R2, baris error, dan peringatan sertifikat jika ada.
+
+-   Disimpan di `telegram.conf` (root, `600`). Token dikirim ke `curl` lewat
+    stdin sehingga tidak muncul di `ps`. Butuh `curl` di host.
+-   Gagal mengirim notifikasi **tidak** mengubah status backup (backup sukses
+    tetap tercatat sukses).
+-   Menu 13 → 9 mengirim pesan tes, 13 → 10 mematikan notifikasi.
+
+## Uninstall instance
+
+Menu **16**. Yang selalu dilakukan:
+
+-   Jadwal auto backup instance ini dimatikan.
+-   Container dihentikan dan dihapus (`docker compose down`).
+-   Salinan script di `/usr/local/sbin` dihapus **hanya jika** tidak dipakai
+    instance lain.
+
+Yang ditanyakan:
+
+  Pertanyaan                                   Default   Catatan
+  -------------------------------------------- --------- -------------------------------
+  Backup terakhir semua database               Ya        Ke `backups/`
+  Hapus data (`data/`) + konfigurasi            Tidak     Butuh ketik `HAPUS DATA`
+  Hapus folder `backups/`                       Tidak     Hanya ditanya jika data dihapus
+
+Konfirmasi akhir: ketik **nama container**. Script itu sendiri, backup di R2,
+dan image Docker tidak dihapus.
+
+-   Data disimpan → instance bisa dinyalakan lagi dengan menu 2.
+-   Data dihapus → folder kembali ke kondisi "Belum setup" dan siap untuk
+    setup baru (menu 1).
+
 ## Koneksi dan SSL
 
 ``` text
@@ -396,7 +493,6 @@ docker logs --tail 100 qolcore-mysql
 
 ## Batasan
 
--   Belum ada: hapus database/user, uninstall instance, notifikasi Telegram.
 -   Restore hanya ke database yang sudah ada.
 -   Dump dari server dengan GTID yang memuat `SET @@GLOBAL.GTID_PURGED` bisa
     gagal di-restore; buat dump dengan `--set-gtid-purged=OFF`.

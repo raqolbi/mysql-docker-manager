@@ -863,6 +863,11 @@ schedule_status() {
   else
     echo "R2          : belum dikonfigurasi"
   fi
+  if tg_configured; then
+    echo "Telegram    : aktif (kirim saat: $([[ "$TG_NOTIFY" == always ]] && echo 'setiap backup' || echo 'gagal saja'))"
+  else
+    echo "Telegram    : belum dikonfigurasi"
+  fi
   echo "Folder lokal: $AUTO_DIR"
   if has_systemd && systemctl is-enabled "$SYSTEMD_UNIT.timer" >/dev/null 2>&1; then
     echo "Scheduler   : systemd timer AKTIF"
@@ -997,19 +1002,428 @@ schedule_menu() {
   echo "  5. Atur kredensial Cloudflare R2"
   echo "  6. Tes koneksi R2"
   echo "  7. Lihat & download backup dari R2"
+  echo "  8. Atur notifikasi Telegram"
+  echo "  9. Tes notifikasi Telegram"
+  echo " 10. Matikan notifikasi Telegram"
   echo "  0. Kembali"
   read -r -p "Pilihan: " c
   case "$c" in
     1) schedule_enable ;;
     2) schedule_disable ;;
-    3) backup_auto ;;
+    3) backup_auto_notify ;;
     4) schedule_logs ;;
     5) r2_configure ;;
     6) r2_test ;;
     7) r2_browse_download ;;
+    8) tg_configure ;;
+    9) tg_test ;;
+    10) tg_disable ;;
     *) return 0 ;;
   esac
 }
+
+# ---------------------------------------------------------------------------
+# NOTIFIKASI TELEGRAM
+# ---------------------------------------------------------------------------
+TG_CONF="$BASE_DIR/telegram.conf"
+TG_API_BASE="${TG_API_BASE:-https://api.telegram.org}"
+
+load_tg_conf() {
+  TG_BOT_TOKEN="" TG_CHAT_ID="" TG_NOTIFY="fail"
+  [[ -f "$TG_CONF" ]] || return 1
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    key=${key//[[:space:]]/}; value=${value//$'\r'/}
+    case "$key" in
+      TG_BOT_TOKEN) if [[ "$value" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then TG_BOT_TOKEN=$value; fi ;;
+      TG_CHAT_ID)   if [[ "$value" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]]; then TG_CHAT_ID=$value; fi ;;
+      TG_NOTIFY)    if [[ "$value" == "fail" || "$value" == "always" ]]; then TG_NOTIFY=$value; fi ;;
+    esac
+  done < "$TG_CONF"
+  [[ -n "$TG_BOT_TOKEN" && -n "$TG_CHAT_ID" ]]
+}
+
+tg_configured() { load_tg_conf 2>/dev/null; }
+
+# Kirim pesan. Token hanya lewat stdin curl (-K -), tidak muncul di daftar proses.
+tg_send() {
+  local text=$1
+  load_tg_conf || { err "Telegram belum dikonfigurasi."; return 1; }
+  command -v curl >/dev/null 2>&1 || { err "curl tidak tersedia; notifikasi Telegram tidak bisa dikirim."; return 1; }
+  (( ${#text} <= 4000 )) || text="${text:0:3990}…"
+  local resp
+  resp=$(printf 'url = "%s/bot%s/sendMessage"\n' "$TG_API_BASE" "$TG_BOT_TOKEN" \
+    | curl -sS --max-time 20 -K - \
+        --data-urlencode "chat_id=$TG_CHAT_ID" \
+        --data-urlencode "text=$text" \
+        --data-urlencode "disable_web_page_preview=true" 2>&1) || { err "Gagal menghubungi Telegram: $resp"; return 1; }
+  if ! grep -qE '"ok"[[:space:]]*:[[:space:]]*true' <<< "$resp"; then
+    err "Telegram menolak pesan: $(sed -nE 's/.*"description"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' <<< "$resp" | head -n1)"
+    return 1
+  fi
+}
+
+tg_configure() {
+  load_tg_conf || true
+  local token chat mode
+  echo "Siapkan dulu:"
+  echo "  1. Buat bot lewat @BotFather di Telegram -> dapatkan token (format 123456:ABC...)."
+  echo "  2. Kirim pesan apa saja ke bot (atau tambahkan bot ke grup), lalu ambil chat ID"
+  echo "     dari https://api.telegram.org/bot<TOKEN>/getUpdates (field chat.id)."
+  echo "Kosongkan isian untuk memakai nilai lama (jika ada)."
+  read -r -s -p "Bot token [${TG_BOT_TOKEN:+(tersimpan)}]: " token; echo; token=${token:-$TG_BOT_TOKEN}
+  [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { err "Format token tidak valid."; return 1; }
+  read -r -p "Chat ID [${TG_CHAT_ID:-}]: " chat; chat=${chat:-$TG_CHAT_ID}
+  [[ "$chat" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]] || { err "Chat ID tidak valid (angka, -100... untuk grup/channel, atau @namachannel)."; return 1; }
+  echo "Kirim notifikasi kapan?"
+  echo "  1. Hanya jika auto backup gagal"
+  echo "  2. Setiap auto backup (berhasil maupun gagal)"
+  local cur=1; [[ "$TG_NOTIFY" == "always" ]] && cur=2
+  read -r -p "Pilihan [$cur]: " mode; mode=${mode:-$cur}
+  case "$mode" in 1) mode=fail ;; 2) mode=always ;; *) err "Pilihan tidak valid."; return 1 ;; esac
+  local tmp; tmp=$(mktemp "$BASE_DIR/.tgconf.XXXXXX")
+  printf 'TG_BOT_TOKEN=%s\nTG_CHAT_ID=%s\nTG_NOTIFY=%s\n' "$token" "$chat" "$mode" > "$tmp"
+  chmod 600 "$tmp"; chown root:root "$tmp"; mv -f "$tmp" "$TG_CONF"
+  echo "Tersimpan di $TG_CONF (permission 600)."
+  tg_test
+}
+
+tg_test() {
+  tg_send "✅ Tes notifikasi MySQL manager
+Host: $(hostname -s 2>/dev/null || echo '?')
+Folder: $BASE_DIR" && echo "Pesan tes terkirim. Cek Telegram Anda."
+}
+
+tg_disable() {
+  if [[ -f "$TG_CONF" ]]; then
+    rm -f -- "$TG_CONF"
+    echo "Notifikasi Telegram dimatikan ($TG_CONF dihapus)."
+  else
+    echo "Notifikasi Telegram belum aktif."
+  fi
+}
+
+# Jalankan auto backup, simpan log-nya, lalu kirim ringkasan ke Telegram sesuai pengaturan.
+backup_auto_notify() {
+  local logf rc
+  logf=$(mktemp)
+  set +e
+  ( set -e; backup_auto ) 2>&1 | tee "$logf"
+  rc=${PIPESTATUS[0]}
+  set -e
+  # backup_auto berjalan di subshell; muat ulang konfigurasi untuk isi pesan.
+  load_config >/dev/null 2>&1 || true
+  if tg_configured && { (( rc != 0 )) || [[ "$TG_NOTIFY" == "always" ]]; }; then
+    local status icon body cert_warn
+    if (( rc == 0 )); then icon="✅"; status="BERHASIL"; else icon="❌"; status="GAGAL"; fi
+    body=$(grep -E 'Backup |GAGAL|ERROR|gagal|selesai|R2|Hapus' "$logf" | sed -E 's/^\[[0-9-]+ ([0-9:]+)\] /\1 /' | tail -n 25)
+    cert_warn=$(cert_expiry_warning 2>/dev/null || true)
+    tg_send "$icon Auto backup MySQL $status
+Host: $(hostname -s 2>/dev/null || echo '?')
+Folder: $BASE_DIR
+Container: ${MYSQL_CONTAINER:-?}
+${cert_warn:+⚠️ $cert_warn
+}
+$body" >/dev/null || echo "Peringatan: notifikasi Telegram gagal dikirim." >&2
+  fi
+  rm -f -- "$logf"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# UNINSTALL INSTANCE
+# ---------------------------------------------------------------------------
+# Hapus path di dalam folder proyek saja (pengaman tambahan untuk rm -rf).
+safe_rm_in_base() {
+  local p
+  for p in "$@"; do
+    [[ -n "$p" && "$p" == "$BASE_DIR"/* && "$p" != *"/../"* && "$p" != *"/.." ]] || { err "Menolak menghapus path di luar folder proyek: '$p'"; return 1; }
+    [[ -e "$p" || -L "$p" ]] || continue
+    rm -rf -- "${p:?}"
+  done
+}
+
+uninstall_instance() {
+  load_config || return 1
+  local final_bk="" del_data="" del_backups="" confirm="" others=""
+  local -a cfg_files=(.env compose.yaml backup.conf r2.conf telegram.conf)
+  echo "=== Uninstall instance MySQL ==="
+  echo "Folder    : $BASE_DIR"
+  echo "Container : $MYSQL_CONTAINER"
+  echo
+  echo "Yang SELALU dilakukan:"
+  echo "  - Menghentikan & menghapus container (docker compose down)"
+  echo "  - Mematikan jadwal auto backup instance ini"
+  echo "Yang opsional (ditanya satu per satu):"
+  echo "  - Backup terakhir semua database sebelum uninstall"
+  echo "  - Menghapus data database (data/) beserta konfigurasi (.env, compose.yaml, dll.)"
+  echo "  - Menghapus folder backups/"
+  echo "Script ini sendiri ($(basename "$SCRIPT_PATH")) tidak dihapus. Backup di R2 tidak disentuh."
+  echo
+
+  if container_running; then
+    read -r -p "Buat backup terakhir semua database dulu? [Y/n]: " final_bk
+    if [[ "${final_bk,,}" != "n" ]]; then
+      local d f failed=0 dbs=()
+      mapfile -t dbs < <(list_app_databases)
+      for d in "${dbs[@]}"; do
+        [[ -n "$d" ]] || continue
+        if f=$(do_backup "$d"); then echo "OK    $f"; else echo "GAGAL $d"; failed=1; fi
+      done
+      do_users_backup >/dev/null || failed=1
+      if (( failed )); then
+        read -r -p "Sebagian backup gagal. Tetap lanjut uninstall? [y/N]: " confirm
+        [[ "${confirm,,}" == "y" ]] || { echo "Dibatalkan."; return 0; }
+      fi
+    fi
+  else
+    echo "Catatan: container tidak berjalan, backup terakhir tidak bisa dibuat."
+  fi
+
+  read -r -p "Hapus juga DATA database (data/) dan konfigurasinya? Tidak bisa dibatalkan. [y/N]: " del_data
+  if [[ "${del_data,,}" == "y" ]]; then
+    read -r -p "Hapus juga folder backups/ (termasuk semua backup lokal)? [y/N]: " del_backups
+  fi
+
+  echo
+  echo "Ringkasan:"
+  echo "  - Container $MYSQL_CONTAINER dihentikan & dihapus"
+  echo "  - Jadwal auto backup dimatikan"
+  if [[ "${del_data,,}" == "y" ]]; then
+    echo "  - DIHAPUS: data/ dan ${cfg_files[*]}"
+  else
+    echo "  - Data & konfigurasi DISIMPAN (bisa dijalankan lagi dengan menu 2)"
+  fi
+  [[ "${del_backups,,}" == "y" ]] && echo "  - DIHAPUS: backups/"
+  read -r -p "Ketik nama container ($MYSQL_CONTAINER) untuk melanjutkan: " confirm
+  [[ "$confirm" == "$MYSQL_CONTAINER" ]] || { echo "Dibatalkan."; return 0; }
+  if [[ "${del_data,,}" == "y" ]]; then
+    read -r -p "Ketik HAPUS DATA untuk konfirmasi penghapusan data: " confirm
+    [[ "$confirm" == "HAPUS DATA" ]] || { echo "Dibatalkan (tidak ada yang diubah)."; return 0; }
+  fi
+
+  log "Mematikan jadwal auto backup"
+  schedule_disable >/dev/null 2>&1 || true
+  log "docker compose down"
+  (cd "$BASE_DIR" && docker compose down --remove-orphans) || { err "docker compose down gagal; tidak ada data yang dihapus."; return 1; }
+
+  # Salinan script untuk scheduler dihapus hanya jika tidak ada instance lain yang memakainya.
+  others=$(ls /etc/systemd/system/mym-backup-*.timer /etc/cron.d/mym-backup-* 2>/dev/null || true)
+  if [[ -z "$others" && -f "$INSTALLED_BIN" ]]; then
+    rm -f -- "$INSTALLED_BIN" && log "Hapus $INSTALLED_BIN (tidak dipakai instance lain)"
+  fi
+
+  if [[ "${del_data,,}" == "y" ]]; then
+    local -a targets=("$BASE_DIR/data")
+    local c
+    for c in "${cfg_files[@]}"; do targets+=("$BASE_DIR/$c"); done
+    log "Menghapus data & konfigurasi"
+    safe_rm_in_base "${targets[@]}" || return 1
+    rm -f -- "$BASE_DIR"/.backup.lock
+  fi
+  if [[ "${del_backups,,}" == "y" ]]; then
+    log "Menghapus backups/"
+    safe_rm_in_base "$BACKUP_DIR" || return 1
+  fi
+  echo
+  echo "Uninstall selesai."
+  if [[ "${del_data,,}" == "y" ]]; then
+    echo "Folder $BASE_DIR siap dipakai untuk setup baru (menu 1)."
+  else
+    echo "Data tetap di $BASE_DIR/data. Jalankan menu 2 untuk menyalakan lagi."
+  fi
+  [[ "${del_backups,,}" == "y" ]] || echo "Backup lokal tetap di $BACKUP_DIR."
+  echo "Image Docker tidak dihapus; hapus manual jika perlu: docker image rm <image>"
+}
+
+# ---------------------------------------------------------------------------
+# HAPUS DATABASE + USER
+# ---------------------------------------------------------------------------
+drop_database() {
+  require_running || return 1
+  local db esc conns ids pre confirm kill drop_users="" u h grants
+  local -a exclusive=() shared=()
+  echo "Database aplikasi:"
+  list_app_databases | sed 's/^/  - /'
+  read -r -p "Nama database yang akan DIHAPUS: " db
+  valid_identifier "$db" || { err "Nama database tidak valid."; return 1; }
+  db_exists "$db" || { err "Database '$db' tidak ditemukan."; return 1; }
+  case "$db" in mysql|information_schema|performance_schema|sys) err "Database sistem tidak boleh dihapus."; return 1 ;; esac
+
+  # Di mysql.db, '_' pada nama database bisa tersimpan sebagai '\_' (escape wildcard).
+  esc=${db//_/\\_}
+  while read -r u h; do
+    [[ -n "$u" ]] || continue
+    # User eksklusif = selain USAGE, hak aksesnya hanya ke database ini.
+    grants=$(mysql_root -N -B --raw -e "SHOW GRANTS FOR $(sql_literal "$u")@$(sql_literal "$h")" \
+      | grep -vE '^GRANT USAGE ON \*\.\* TO ' | grep -vE "^GRANT .* ON \`($db|${esc//\\/\\\\})\`\.\* TO " || true)
+    if [[ -z "$grants" ]]; then exclusive+=("$u@$h"); else shared+=("$u@$h"); fi
+  done < <(mysql_q "SELECT DISTINCT user, host FROM mysql.db WHERE (db=$(sql_literal "$db") OR db=$(sql_literal "$esc")) AND user <> 'root' ORDER BY user, host")
+
+  ids=$(mysql_q "SELECT id FROM information_schema.processlist WHERE db=$(sql_literal "$db") AND id <> CONNECTION_ID()" | tr '\n' ' ')
+  conns=$(wc -w <<< "$ids")
+  echo "Koneksi aktif   : $conns"
+  (( ${#exclusive[@]} )) && echo "User khusus db ini   : ${exclusive[*]}"
+  (( ${#shared[@]} )) && echo "User dengan akses lain: ${shared[*]} (hanya hak ke '$db' yang dicabut)"
+  if (( conns > 0 )); then
+    read -r -p "Ada $conns koneksi aktif. Putuskan semuanya saat menghapus? [y/N]: " kill
+    [[ "${kill,,}" == "y" ]] || { echo "Dibatalkan. Hentikan aplikasi yang memakai '$db' dulu."; return 0; }
+  fi
+  if (( ${#exclusive[@]} )); then
+    read -r -p "Hapus juga user khusus database ini (${exclusive[*]})? [Y/n]: " drop_users
+    [[ "${drop_users,,}" == "n" ]] && drop_users="" || drop_users=1
+  fi
+  read -r -p "Backup database '$db' dulu sebelum dihapus? [Y/n]: " pre
+  if [[ "${pre,,}" != "n" ]]; then
+    local bk
+    bk=$(do_backup "$db") || { err "Backup gagal; penghapusan dibatalkan."; return 1; }
+    echo "Backup: $bk"
+  fi
+  echo
+  echo "AKAN DIHAPUS PERMANEN: database '$db'${drop_users:+ dan user ${exclusive[*]}}."
+  read -r -p "Ketik nama database ($db) untuk konfirmasi: " confirm
+  [[ "$confirm" == "$db" ]] || { echo "Dibatalkan."; return 0; }
+
+  local id
+  for id in $ids; do
+    [[ "$id" =~ ^[0-9]+$ ]] && mysql_root -e "KILL $id" >/dev/null 2>&1 || true
+  done
+  mysql_root -e "DROP DATABASE $(sql_ident "$db");" || { err "Gagal menghapus database."; return 1; }
+  echo "Database '$db' dihapus."
+  # MySQL tidak mencabut grant saat database dihapus; tanpa ini, database baru dengan
+  # nama sama otomatis bisa diakses lagi oleh user lama.
+  local a
+  for a in "${shared[@]}"; do
+    u=${a%@*}; h=${a#*@}
+    mysql_root -e "REVOKE ALL PRIVILEGES ON $(sql_ident "$db").* FROM $(sql_literal "$u")@$(sql_literal "$h");" >/dev/null 2>&1 \
+      && echo "Hak $a ke '$db' dicabut." || true
+  done
+  if [[ -n "$drop_users" ]]; then
+    for a in "${exclusive[@]}"; do
+      u=${a%@*}; h=${a#*@}
+      if mysql_root -e "DROP USER $(sql_literal "$u")@$(sql_literal "$h");"; then echo "User $a dihapus."; else echo "User $a gagal dihapus."; fi
+    done
+  else
+    for a in "${exclusive[@]}"; do
+      u=${a%@*}; h=${a#*@}
+      mysql_root -e "REVOKE ALL PRIVILEGES ON $(sql_ident "$db").* FROM $(sql_literal "$u")@$(sql_literal "$h");" >/dev/null 2>&1 || true
+    done
+  fi
+  [[ "$db" != "$MYSQL_DATABASE" ]] || echo "Catatan: '$db' adalah database awal di .env (MYSQL_DATABASE); nilai itu hanya dipakai saat setup pertama."
+}
+
+# ---------------------------------------------------------------------------
+# SERTIFIKAT SSL
+# ---------------------------------------------------------------------------
+# MySQL menyimpan sertifikat di datadir: ca.pem, server-cert.pem, server-key.pem.
+SSL_CERT_FILE="$DATA_DIR/server-cert.pem"
+SSL_KEY_FILE="$DATA_DIR/server-key.pem"
+SSL_CA_FILE="$DATA_DIR/ca.pem"
+
+cert_days_left() {
+  local f=${1:-$SSL_CERT_FILE} end
+  [[ -r "$f" ]] || return 1
+  end=$(openssl x509 -in "$f" -noout -enddate 2>/dev/null | cut -d= -f2) || return 1
+  echo $(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+}
+
+cert_expiry_warning() {
+  local d
+  d=$(cert_days_left) || return 0
+  if (( d < 0 )); then
+    echo "Sertifikat SSL sudah KEDALUWARSA $(( -d )) hari lalu. Rotasi lewat menu 15."
+  elif (( d < 30 )); then
+    echo "Sertifikat SSL berakhir dalam $d hari. Rotasi lewat menu 15."
+  fi
+}
+
+show_cert_info() {
+  local f=$1
+  openssl x509 -in "$f" -noout -subject -issuer -enddate 2>/dev/null | sed -E 's/^subject=/  Subject : /; s/^issuer=/  Issuer  : /; s/^notAfter=/  Berlaku s.d.: /'
+  echo "  Sisa    : $(cert_days_left "$f") hari"
+}
+
+served_not_after() {
+  mysql_q "SELECT variable_value FROM performance_schema.global_status WHERE variable_name='Ssl_server_not_after'" 2>/dev/null | head -n1
+}
+
+rotate_ssl() {
+  require_running || return 1
+  need_cmd openssl || return 1
+  [[ -f "$SSL_CERT_FILE" && -f "$SSL_KEY_FILE" ]] || { err "Sertifikat tidak ditemukan di $DATA_DIR."; return 1; }
+  local choice tmpd ts bdir crt_in key_in ca_in uid gid f before after
+  # Owner diambil dari key yang sedang dipakai mysqld (pasti terbaca olehnya).
+  uid=$(stat -c '%u' "$SSL_KEY_FILE"); gid=$(stat -c '%g' "$SSL_KEY_FILE")
+  echo "Sertifikat saat ini:"
+  show_cert_info "$SSL_CERT_FILE"
+  echo
+  echo "  1. Buat CA + sertifikat self-signed baru (berlaku 10 tahun)"
+  echo "  2. Pakai sertifikat sendiri (mis. dari CA / Let's Encrypt): fullchain + key (+ CA opsional)"
+  echo "  0. Batal"
+  read -r -p "Pilihan: " choice
+  case "$choice" in 1|2) ;; *) echo "Dibatalkan."; return 0 ;; esac
+
+  tmpd=$(mktemp -d "$BASE_DIR/.ssl.XXXXXX")
+  if [[ "$choice" == 1 ]]; then
+    if ! { openssl req -new -x509 -days 3650 -nodes -newkey rsa:2048 -keyout "$tmpd/ca-key.pem" -out "$tmpd/ca.pem" \
+             -subj "/CN=${MYSQL_CONTAINER}_CA" \
+        && openssl req -new -nodes -newkey rsa:2048 -keyout "$tmpd/server-key.pem" -out "$tmpd/server.csr" \
+             -subj "/CN=${MYSQL_CONTAINER}" \
+        && openssl x509 -req -days 3650 -in "$tmpd/server.csr" -CA "$tmpd/ca.pem" -CAkey "$tmpd/ca-key.pem" \
+             -CAcreateserial -out "$tmpd/server-cert.pem"; } >/dev/null 2>&1; then
+      safe_rm_in_base "$tmpd"; err "Gagal membuat sertifikat."; return 1
+    fi
+  else
+    read -r -p "Path file sertifikat (fullchain.pem / .crt): " crt_in; crt_in=$(expand_path "$crt_in")
+    read -r -p "Path file private key (privkey.pem / .key): " key_in; key_in=$(expand_path "$key_in")
+    read -r -p "Path file CA/chain (kosong = pertahankan ca.pem lama): " ca_in; [[ -z "$ca_in" ]] || ca_in=$(expand_path "$ca_in")
+    [[ -r "$crt_in" && -r "$key_in" ]] || { safe_rm_in_base "$tmpd"; err "File tidak ditemukan / tidak bisa dibaca."; return 1; }
+    [[ -z "$ca_in" || -r "$ca_in" ]] || { safe_rm_in_base "$tmpd"; err "File CA tidak bisa dibaca."; return 1; }
+    openssl x509 -in "$crt_in" -noout 2>/dev/null || { safe_rm_in_base "$tmpd"; err "File sertifikat tidak valid (harus PEM)."; return 1; }
+    openssl pkey -in "$key_in" -noout 2>/dev/null || { safe_rm_in_base "$tmpd"; err "Private key tidak valid atau terenkripsi passphrase."; return 1; }
+    if [[ "$(openssl x509 -in "$crt_in" -noout -pubkey 2>/dev/null)" != "$(openssl pkey -in "$key_in" -pubout 2>/dev/null)" ]]; then
+      safe_rm_in_base "$tmpd"; err "Private key tidak cocok dengan sertifikat."; return 1
+    fi
+    openssl x509 -in "$crt_in" -noout -checkend 0 >/dev/null 2>&1 || { safe_rm_in_base "$tmpd"; err "Sertifikat sudah kedaluwarsa."; return 1; }
+    cat -- "$crt_in" > "$tmpd/server-cert.pem"; cat -- "$key_in" > "$tmpd/server-key.pem"
+    if [[ -n "$ca_in" ]]; then cat -- "$ca_in" > "$tmpd/ca.pem"; fi
+  fi
+  echo "Sertifikat baru:"
+  show_cert_info "$tmpd/server-cert.pem"
+
+  ts=$(date +%Y%m%d-%H%M%S)
+  bdir="$BACKUP_DIR/ssl-$ts"
+  mkdir -p "$bdir"; chmod 700 "$bdir"
+  for f in ca.pem ca-key.pem server-cert.pem server-key.pem; do
+    [[ -f "$DATA_DIR/$f" ]] && cp -p -- "$DATA_DIR/$f" "$bdir/"
+  done
+  for f in ca.pem ca-key.pem server-cert.pem server-key.pem; do
+    [[ -f "$tmpd/$f" ]] || continue
+    install -o "$uid" -g "$gid" -m 600 "$tmpd/$f" "$DATA_DIR/$f"
+  done
+  [[ -f "$tmpd/ca.pem" ]] && chmod 644 "$DATA_DIR/ca.pem"
+  [[ -f "$tmpd/server-cert.pem" ]] && chmod 644 "$DATA_DIR/server-cert.pem"
+  safe_rm_in_base "$tmpd"
+  echo "Sertifikat lama disimpan di $bdir"
+
+  before=$(served_not_after)
+  if mysql_root -e "ALTER INSTANCE RELOAD TLS" 2>/tmp/.mym-tls.$$; then
+    after=$(served_not_after)
+    echo "TLS dimuat ulang tanpa restart. Berlaku s.d. (dari server): ${after:-?}"
+    rm -f -- /tmp/.mym-tls.$$
+  else
+    err "MySQL menolak sertifikat baru: $(head -n 1 /tmp/.mym-tls.$$)"
+    rm -f -- /tmp/.mym-tls.$$
+    # Kembalikan persis seperti semula (owner & mode ikut, karena dibackup dengan cp -p).
+    for f in ca.pem ca-key.pem server-cert.pem server-key.pem; do
+      if [[ -f "$bdir/$f" ]]; then cp -p -- "$bdir/$f" "$DATA_DIR/$f"; fi
+    done
+    mysql_root -e "ALTER INSTANCE RELOAD TLS" >/dev/null 2>&1 || true
+    err "Sertifikat lama dikembalikan (server masih memakai sertifikat sebelumnya: ${before:-?})."
+    return 1
+  fi
+}
+
 
 # ---------------------------------------------------------------------------
 # RESTORE
@@ -1606,7 +2020,7 @@ run_action() {
 }
 
 main_menu() {
-  local choice
+  local choice cw
   trap 'echo' INT
   while true; do
     clear 2>/dev/null || true
@@ -1617,6 +2031,8 @@ main_menu() {
     if [[ -f "$ENV_FILE" ]] && load_config 2>/dev/null; then
       echo "Container: $MYSQL_CONTAINER | Bind: $MYSQL_BIND:$MYSQL_PORT"
       check_ownership
+      cw=$(cert_expiry_warning 2>/dev/null || true)
+      [[ -z "$cw" ]] || echo "PERINGATAN: $cw"
     elif [[ -f "$COMPOSE_FILE" ]]; then
       echo "Status: compose.yaml ada tetapi .env tidak ditemukan/tidak valid"
     else
@@ -1636,6 +2052,9 @@ main_menu() {
     echo "11. Lihat MySQL logs"
     echo "12. Ganti password user/root"
     echo "13. Auto backup & Cloudflare R2"
+    echo "14. Hapus database + user"
+    echo "15. Rotasi sertifikat SSL"
+    echo "16. Uninstall instance (hapus container, opsional data)"
     echo " 0. Keluar"
     echo "=============================================="
     if ! read -r -p "Pilih menu: " choice; then echo; exit 0; fi
@@ -1654,6 +2073,9 @@ main_menu() {
       11) run_action show_logs ;;
       12) run_action change_password ;;
       13) run_action schedule_menu ;;
+      14) run_action drop_database ;;
+      15) run_action rotate_ssl ;;
+      16) run_action uninstall_instance ;;
       0) echo "Selesai."; exit 0 ;;
       *) echo "Pilihan tidak dikenal."; pause ;;
     esac
@@ -1672,7 +2094,7 @@ case "${1:-}" in
     # Mode non-interaktif untuk scheduler (systemd timer / cron).
     need_cmd docker; need_cmd flock; need_cmd gzip
     set +e
-    ( set -e; backup_auto )
+    backup_auto_notify
     exit $?
     ;;
   "") ;;

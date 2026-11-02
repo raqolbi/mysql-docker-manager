@@ -12,3 +12,6 @@ r2.conf
 .r2-delete.*
 data/
 backups/
+telegram.conf
+.tgconf.*
+.ssl.*
