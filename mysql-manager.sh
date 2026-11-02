@@ -735,8 +735,15 @@ EOF
   [[ "$ret" =~ ^[0-9]+$ ]] || { err "Retensi harus angka."; return 1; }
   engine=${R2_RCLONE:-docker}
   if [[ "$engine" == "docker" ]] && command -v rclone >/dev/null 2>&1; then
-    read -r -p "rclone terpasang di host. Pakai rclone host, bukan container? [y/N]: " ret2
-    [[ "${ret2,,}" == "y" ]] && engine=host
+    local rv rmaj rmin
+    rv=$(rclone version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+' | head -n1 || true)
+    rmaj=${rv%%.*}; rmin=${rv#*.}
+    if [[ "$rv" =~ ^[0-9]+\.[0-9]+$ ]] && (( rmaj > 1 || (rmaj == 1 && rmin >= 59) )); then
+      read -r -p "rclone $rv terpasang di host. Pakai rclone host, bukan container? [y/N]: " ret2
+      [[ "${ret2,,}" == "y" ]] && engine=host
+    else
+      echo "Catatan: rclone di host (versi ${rv:-?}) terlalu lama untuk R2 (butuh 1.59+); dipakai container rclone."
+    fi
   fi
 
   local tmp; tmp=$(mktemp "$BASE_DIR/.r2conf.XXXXXX")
@@ -847,7 +854,7 @@ prune_backups() {
 
 # Dipanggil oleh scheduler: `mysql-manager backup-auto`. Non-interaktif.
 backup_auto() {
-  local db failed=0 ok=0 dbs=()
+  local db failed=0 ok=0 dbs=() upload_ok=1
   # Kunci pada folder itu sendiri (dibuka read-only): tidak ada file lock yang bisa
   # dibelokkan lewat symlink untuk menimpa file lain sebagai root.
   exec 9<"$BASE_DIR"
@@ -858,7 +865,7 @@ backup_auto() {
   load_backup_conf
   if [[ "$BACKUP_TARGET" != "local" ]] && ! r2_configured; then
     err "Target '$BACKUP_TARGET' butuh R2, tetapi $R2_CONF belum lengkap. Backup tetap disimpan lokal."
-    failed=1
+    failed=1; upload_ok=0
   fi
   if [[ "$BACKUP_DATABASES" == "all" ]]; then
     mapfile -t dbs < <(list_app_databases)
@@ -878,9 +885,11 @@ backup_auto() {
 
   # Upload dulu, baru retensi lokal: file yang belum ter-upload tidak dihapus duluan.
   if [[ "$BACKUP_TARGET" != "local" ]] && r2_configured; then
+    upload_ok=0
     local mode=copy
     [[ "$BACKUP_TARGET" == "r2" ]] && mode=move
     if r2_sync_auto "$mode"; then
+      upload_ok=1
       log "Upload R2 berhasil."
       r2_prune "$R2_RETENTION_DAYS" || failed=1
     else
@@ -889,7 +898,11 @@ backup_auto() {
     fi
   fi
   # Retensi lokal hanya kalau ada backup baru yang berhasil.
-  if (( ok > 0 )); then prune_backups "$BACKUP_RETENTION_DAYS"; fi
+  if (( ok > 0 )) && (( upload_ok )); then
+    prune_backups "$BACKUP_RETENTION_DAYS"
+  elif (( ok > 0 )); then
+    log "Retensi lokal dilewati: upload R2 gagal, backup lokal lama disimpan sampai berhasil ter-upload."
+  fi
   if (( failed == 0 )); then
     log "Auto backup selesai: $ok database OK"
   else
@@ -1149,6 +1162,7 @@ for cid, (t, n) in seen.items():
 
 tg_configure() {
   load_tg_conf || true
+  command -v curl >/dev/null 2>&1 || { err "curl belum terpasang di server. Pasang dulu (mis. sudo apt install curl), lalu ulangi."; return 1; }
   local token chat mode resp botname rows=() r i pick
   cat <<'EOF'
 === Notifikasi Telegram ===
@@ -1190,7 +1204,11 @@ EOF
   while true; do
     echo
     echo "Pastikan langkah 2 sudah dilakukan (kirim pesan ke @${botname:-bot} / /start@${botname:-bot} di grup)."
-    read -r -p "Tekan Enter untuk mencari chat, atau ketik chat ID manual${TG_CHAT_ID:+ [tersimpan: $TG_CHAT_ID]}: " chat
+    if [[ -n "$TG_CHAT_ID" ]]; then
+      read -r -p "Enter = cari chat otomatis | ketik chat ID manual | '-' = pakai yang tersimpan ($TG_CHAT_ID): " chat
+    else
+      read -r -p "Enter = cari chat otomatis | atau ketik chat ID manual: " chat
+    fi
     [[ -z "$chat" ]] || break
     mapfile -t rows < <(tg_find_chats "$token")
     if (( ${#rows[@]} > 0 )) && [[ "${rows[0]}" == ERR* ]]; then
@@ -1218,7 +1236,7 @@ EOF
     fi
     echo "Pilihan tidak valid."
   done
-  [[ "$chat" == "-" ]] && chat=$TG_CHAT_ID
+  if [[ "$chat" == "-" ]]; then chat=$TG_CHAT_ID; fi
   [[ "$chat" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]] || { err "Chat ID tidak valid (angka; grup/channel diawali -100; atau @namachannel)."; return 1; }
 
   echo

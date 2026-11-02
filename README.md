@@ -232,6 +232,9 @@ run berikutnya; status run dicatat gagal.
     lebih tua dari N × 24 jam dihapus **saat auto backup berjalan**, setelah
     backup baru berhasil.
 -   Backup **terbaru tiap database selalu disisakan**, walau sudah lewat batas.
+-   Mode **lokal + R2**: jika upload ke R2 gagal, retensi lokal **dilewati**
+    pada run itu, supaya backup lama yang mungkin belum sampai ke R2 tidak
+    terhapus. Retensi berjalan lagi setelah upload berhasil.
 -   Hanya berlaku untuk backup otomatis. Backup manual, backup pengaman
     sebelum restore, folder `manual/` di R2, dan `backups/downloaded/` tidak
     dihapus otomatis.
@@ -275,8 +278,9 @@ sudo MYM_BASE_DIR=/opt/mysql /usr/local/sbin/mysql-manager backup-auto
     └── manual/    # upload dari menu 6 (tidak dihapus otomatis)
 ```
 
--   rclone dijalankan sebagai container `rclone/rclone:1.68.2` (atau rclone di
-    host jika dipilih). Kredensial lewat env-file sementara (`600`, langsung
+-   rclone dijalankan sebagai container `rclone/rclone:1.68.2`. rclone di host
+    hanya ditawarkan jika versinya 1.59+ (versi lama tidak mengenal provider
+    Cloudflare). Kredensial lewat env-file sementara (`600`, langsung
     dihapus), tidak pernah muncul di `ps`.
 -   File backup berisi seluruh data, dan `users-*.sql` berisi hash password.
     Pastikan bucket tidak publik dan token hanya untuk bucket itu.
@@ -461,7 +465,10 @@ Isi pesan: status (✅/❌), host, folder, container, ringkasan per database,
 status upload R2, baris error, dan peringatan sertifikat jika ada.
 
 -   Disimpan di `telegram.conf` (root, `600`). Token dikirim ke `curl` lewat
-    stdin sehingga tidak muncul di `ps`. Butuh `curl` dan `python3` di host.
+    stdin sehingga tidak muncul di `ps`. Butuh `curl` (script memberi tahu
+    jika belum terpasang) dan `python3` (untuk pencarian chat otomatis) di host.
+-   Saat mengubah pengaturan, ketik `-` pada pertanyaan chat ID untuk memakai
+    chat ID yang sudah tersimpan.
 -   Gagal mengirim notifikasi **tidak** mengubah status backup.
 -   Menu 13 → 9 mengirim pesan tes, 13 → 10 mematikan notifikasi.
 
