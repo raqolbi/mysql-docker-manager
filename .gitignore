@@ -1,0 +1,14 @@
+# File runtime yang dibuat mysql-manager.sh di folder ini.
+# Berisi password, kredensial R2, data database, dan backup: JANGAN di-commit.
+.env
+.env.*
+compose.yaml
+backup.conf
+r2.conf
+.backup.lock
+.rclone-env.*
+.r2conf.*
+.r2-test.*
+.r2-delete.*
+data/
+backups/
