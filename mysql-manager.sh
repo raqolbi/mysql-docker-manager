@@ -84,12 +84,29 @@ load_config() {
   fi
 }
 
+# Folder proyek & backups dipakai proses root (scheduler). Jika bisa diubah user
+# non-root, user itu bisa membelokkan file lewat symlink / mengganti konfigurasi.
+base_dir_safe() {
+  local d owner mode
+  for d in "$BASE_DIR" "$BACKUP_DIR"; do
+    [[ -e "$d" ]] || continue
+    if [[ -L "$d" ]]; then err "$d adalah symlink; ditolak demi keamanan."; return 1; fi
+    owner=$(stat -c '%u' "$d"); mode=$(stat -c '%a' "$d")
+    if [[ "$owner" != "0" ]] || (( (8#$mode & 8#022) != 0 )); then
+      err "$d dimiliki uid $owner (mode $mode). Proses root tidak boleh bekerja di folder yang bisa diubah user lain."
+      err "Perbaiki: sudo chown root:root $d && sudo chmod go-w $d"
+      return 1
+    fi
+  done
+}
+
 # File yang dipakai perintah root tidak boleh bisa ditulis user lain.
 check_ownership() {
   local f owner mode
-  mode=$(stat -c '%a' "$BASE_DIR")
-  if (( (8#$mode & 8#022) != 0 )); then
-    echo "PERINGATAN: folder $BASE_DIR (mode $mode) bisa ditulis user lain. Jalankan: sudo chmod go-w $BASE_DIR"
+  owner=$(stat -c '%u' "$BASE_DIR"); mode=$(stat -c '%a' "$BASE_DIR")
+  if [[ "$owner" != "0" ]] || (( (8#$mode & 8#022) != 0 )); then
+    echo "PERINGATAN: folder $BASE_DIR dimiliki uid $owner (mode $mode); auto backup menolak berjalan di folder"
+    echo "           yang bisa diubah user non-root. Perbaiki: sudo chown root:root $BASE_DIR && sudo chmod go-w $BASE_DIR"
   fi
   for f in "$ENV_FILE" "$COMPOSE_FILE"; do
     [[ -e "$f" ]] || continue
@@ -111,6 +128,10 @@ check_docker() {
 }
 
 # Nama database: huruf/angka/underscore, maks 64. Username: maks 32 (batas MySQL).
+# Nama database yang SUDAH ADA (bisa dibuat aplikasi lain, mis. "my-app"): lebih longgar
+# dari aturan pembuatan, tetap aman untuk nama file dan SQL ber-quote.
+valid_dbname() { [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_\$-]{0,62}$ ]]; }
+
 valid_identifier() { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]{0,63}$ ]]; }
 valid_username()   { [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]{0,31}$ ]]; }
 valid_host()       { [[ "$1" =~ ^[A-Za-z0-9._%:-]{1,255}$ ]]; }
@@ -293,6 +314,7 @@ MYSQL_BIND=$bind
 MYSQL_CONTAINER=$container
 MYSQL_UID=$my_uid
 MYSQL_GID=$my_gid
+COMPOSE_PROJECT_NAME=mym-${SCHED_ID}
 EOF
   chmod 600 "$ENV_FILE"
 
@@ -522,7 +544,7 @@ backup_database() {
       if file=$(do_backup "$d"); then echo "OK    $file ($(du -h "$file" | cut -f1))"; files+=("$file"); else echo "GAGAL $d"; failed=1; fi
     done
   else
-    valid_identifier "$db" || { err "Nama database tidak valid."; return 1; }
+    valid_dbname "$db" || { err "Nama database tidak valid."; return 1; }
     db_exists "$db" || { err "Database '$db' tidak ditemukan."; return 1; }
     file=$(do_backup "$db") || return 1
     files+=("$file")
@@ -669,10 +691,31 @@ r2_configure() {
   load_config || return 1
   load_r2_conf || true
   local acc key secret bucket prefix endpoint ret ret2="" engine
-  echo "Siapkan dulu di dashboard Cloudflare:"
-  echo "  - Bucket R2 (private)."
-  echo "  - R2 API Token dengan izin 'Object Read & Write' HANYA untuk bucket tsb."
-  echo "Kosongkan isian untuk memakai nilai lama (jika ada)."
+  cat <<'EOF'
+=== Cloudflare R2 ===
+
+LANGKAH 1 - Buat bucket
+  Dashboard Cloudflare -> R2 Object Storage -> Create bucket.
+  Isi nama (huruf kecil/angka/'-', mis. db-backup). Biarkan PRIVATE: jangan aktifkan
+  "Public access" / r2.dev.
+
+LANGKAH 2 - Catat Account ID
+  Di halaman R2 Object Storage (Overview), bagian "Account Details" -> Account ID
+  (32 karakter heksadesimal). Account ID juga terlihat di URL dashboard
+  (dash.cloudflare.com/<ACCOUNT_ID>/...).
+
+LANGKAH 3 - Buat API token
+  R2 Object Storage -> "Manage API tokens" -> Create API Token
+  ("Account API token" disarankan; "User API token" juga bisa):
+    - Permissions      : Object Read & Write
+    - Specify bucket(s): Apply to specific buckets only -> pilih bucket langkah 1
+    - TTL              : Forever (atau sesuai kebijakan Anda)
+  Klik Create, lalu salin "Access Key ID" dan "Secret Access Key".
+  Secret hanya ditampilkan SEKALI; simpan sebelum menutup halaman.
+  (Bagian "Token value" tidak dipakai di sini.)
+
+Kosongkan isian untuk memakai nilai lama (jika ada).
+EOF
   read -r -p "Account ID [${R2_ACCOUNT_ID:-}]: " acc; acc=${acc:-$R2_ACCOUNT_ID}
   [[ "$acc" =~ ^[A-Za-z0-9]+$ ]] || { err "Account ID tidak valid."; return 1; }
   read -r -p "Access Key ID [${R2_ACCESS_KEY_ID:+(tersimpan)}]: " key; key=${key:-$R2_ACCESS_KEY_ID}
@@ -788,7 +831,7 @@ prune_backups() {
   mapfile -t dbs < <(find "${AUTO_DIR:?}" -maxdepth 1 -type f -name '*.sql.gz' -printf '%f\n' \
                      | sed -E 's/-[0-9]{8}-[0-9]{6}(-[0-9]+)?\.sql\.gz$//' | sort -u)
   for db in "${dbs[@]}"; do
-    valid_identifier "$db" || continue
+    valid_dbname "$db" || continue
     newest=$(find "${AUTO_DIR:?}" -maxdepth 1 -type f -name "${db}-*.sql.gz" -printf '%T@ %p\n' | sort -nr | head -n1 | cut -d' ' -f2-)
     while IFS= read -r f; do
       [[ -n "$f" && "$f" != "$newest" ]] || continue
@@ -805,8 +848,11 @@ prune_backups() {
 # Dipanggil oleh scheduler: `mysql-manager backup-auto`. Non-interaktif.
 backup_auto() {
   local db failed=0 ok=0 dbs=()
-  exec 9>"$BASE_DIR/.backup.lock"
+  # Kunci pada folder itu sendiri (dibuka read-only): tidak ada file lock yang bisa
+  # dibelokkan lewat symlink untuk menimpa file lain sebagai root.
+  exec 9<"$BASE_DIR"
   flock -n 9 || { err "Backup lain sedang berjalan; dilewati."; return 1; }
+  base_dir_safe || return 1
   load_config || return 1
   container_running || { err "Container '$MYSQL_CONTAINER' tidak berjalan."; return 1; }
   load_backup_conf
@@ -823,7 +869,7 @@ backup_auto() {
   log "Auto backup mulai: ${dbs[*]} (target: $(target_label "$BACKUP_TARGET"))"
   for db in "${dbs[@]}"; do
     [[ -n "$db" ]] || continue
-    if ! valid_identifier "$db" || ! db_exists "$db"; then
+    if ! valid_dbname "$db" || ! db_exists "$db"; then
       err "Database '$db' tidak ditemukan; dilewati."; failed=1; continue
     fi
     if do_backup "$db" "$AUTO_DIR" >/dev/null; then ok=$((ok+1)); else failed=1; fi
@@ -1063,18 +1109,119 @@ tg_send() {
   fi
 }
 
+# Panggil Bot API. Token hanya lewat stdin curl (-K -), tidak muncul di daftar proses.
+tg_call() {
+  local token=$1 method=$2; shift 2
+  command -v curl >/dev/null 2>&1 || { echo '{"ok":false,"description":"curl tidak tersedia di server"}'; return 0; }
+  printf 'url = "%s/bot%s/%s"\n' "$TG_API_BASE" "$token" "$method" \
+    | curl -sS --max-time 20 -K - "$@" 2>&1 || true
+}
+
+tg_ok() { grep -qE '"ok"[[:space:]]*:[[:space:]]*true' <<< "$1"; }
+tg_desc() { sed -nE 's/.*"description"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' <<< "$1" | head -n1; }
+
+# Daftar chat yang pernah mengirim pesan ke bot: "<chat_id><TAB><jenis><TAB><nama>".
+tg_find_chats() {
+  local token=$1 resp
+  resp=$(tg_call "$token" getUpdates --data-urlencode "allowed_updates=[\"message\",\"channel_post\",\"my_chat_member\"]")
+  if ! tg_ok "$resp"; then
+    echo "ERR	$(tg_desc "$resp")"
+    return 0
+  fi
+  command -v python3 >/dev/null 2>&1 || { echo "ERR	python3 tidak tersedia untuk membaca daftar chat"; return 0; }
+  python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+seen = {}
+for u in d.get("result", []):
+    for k in ("message", "edited_message", "channel_post", "edited_channel_post", "my_chat_member"):
+        m = u.get(k)
+        if m and "chat" in m:
+            c = m["chat"]
+            name = c.get("title") or " ".join(x for x in (c.get("first_name"), c.get("last_name")) if x) or c.get("username") or "-"
+            if c.get("username") and c.get("type") != "private":
+                name += " (@" + c["username"] + ")"
+            seen[c["id"]] = (c.get("type", "?"), name)
+for cid, (t, n) in seen.items():
+    print("%s\t%s\t%s" % (cid, t, n.replace("\t", " ")))
+' <<< "$resp"
+}
+
 tg_configure() {
   load_tg_conf || true
-  local token chat mode
-  echo "Siapkan dulu:"
-  echo "  1. Buat bot lewat @BotFather di Telegram -> dapatkan token (format 123456:ABC...)."
-  echo "  2. Kirim pesan apa saja ke bot (atau tambahkan bot ke grup), lalu ambil chat ID"
-  echo "     dari https://api.telegram.org/bot<TOKEN>/getUpdates (field chat.id)."
-  echo "Kosongkan isian untuk memakai nilai lama (jika ada)."
-  read -r -s -p "Bot token [${TG_BOT_TOKEN:+(tersimpan)}]: " token; echo; token=${token:-$TG_BOT_TOKEN}
-  [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { err "Format token tidak valid."; return 1; }
-  read -r -p "Chat ID [${TG_CHAT_ID:-}]: " chat; chat=${chat:-$TG_CHAT_ID}
-  [[ "$chat" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]] || { err "Chat ID tidak valid (angka, -100... untuk grup/channel, atau @namachannel)."; return 1; }
+  local token chat mode resp botname rows=() r i pick
+  cat <<'EOF'
+=== Notifikasi Telegram ===
+
+LANGKAH 1 - Buat bot & ambil token
+  1. Buka Telegram, cari @BotFather (akun resmi, ada centang biru), tekan Start.
+  2. Kirim perintah:  /newbot
+  3. Isi nama bot (bebas, mis. "Backup Server DB").
+  4. Isi username bot, harus diakhiri "bot" (mis. qolcore_backup_bot).
+  5. BotFather membalas dengan token seperti:
+        123456789:AAH4xYz...panjang...
+     Salin token itu. RAHASIAKAN: siapa pun yang punya token bisa memakai bot Anda.
+     Jika token bocor, kirim /revoke ke @BotFather untuk membuat token baru.
+
+LANGKAH 2 - Ke mana notifikasi dikirim (pilih salah satu)
+  - Chat pribadi : buka bot Anda (link t.me/<username_bot> dari BotFather),
+                   tekan Start atau kirim pesan apa saja.
+  - Grup         : tambahkan bot ke grup, lalu kirim di grup:  /start@<username_bot>
+  - Channel      : jadikan bot ADMIN channel (izin "Post messages"),
+                   lalu buat satu postingan di channel.
+  Bot tidak bisa mengirim pesan ke Anda sebelum langkah 2 dilakukan.
+
+LANGKAH 3 - Script mencari chat ID otomatis dari pesan di langkah 2.
+EOF
+  echo
+  read -r -s -p "Tempel bot token${TG_BOT_TOKEN:+ (kosong = pakai yang tersimpan)}: " token; echo
+  token=${token:-$TG_BOT_TOKEN}
+  token=${token//[[:space:]]/}
+  [[ "$token" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || { err "Format token tidak valid. Contoh: 123456789:AAH4xYz... (angka, titik dua, lalu huruf/angka)."; return 1; }
+  resp=$(tg_call "$token" getMe)
+  if ! tg_ok "$resp"; then
+    err "Token ditolak Telegram: $(tg_desc "$resp")"
+    err "Periksa token (salin ulang dari @BotFather) dan pastikan server bisa mengakses api.telegram.org."
+    return 1
+  fi
+  botname=$(sed -nE 's/.*"username"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' <<< "$resp" | head -n1)
+  echo "Token valid. Bot: @${botname:-?}"
+
+  while true; do
+    echo
+    echo "Pastikan langkah 2 sudah dilakukan (kirim pesan ke @${botname:-bot} / /start@${botname:-bot} di grup)."
+    read -r -p "Tekan Enter untuk mencari chat, atau ketik chat ID manual${TG_CHAT_ID:+ [tersimpan: $TG_CHAT_ID]}: " chat
+    [[ -z "$chat" ]] || break
+    mapfile -t rows < <(tg_find_chats "$token")
+    if (( ${#rows[@]} > 0 )) && [[ "${rows[0]}" == ERR* ]]; then
+      local why=${rows[0]#ERR	}
+      err "Tidak bisa membaca pesan bot: $why"
+      [[ "$why" == *webhook* ]] && err "Bot ini memakai webhook (dipakai aplikasi lain). Ketik chat ID manual, atau pakai bot terpisah khusus notifikasi."
+      rows=()
+    fi
+    if (( ${#rows[@]} == 0 )); then
+      echo "Belum ada chat yang ditemukan. Kirim pesan ke bot dulu (langkah 2), lalu coba lagi."
+      echo "Catatan: Telegram hanya menyimpan pesan bot selama 24 jam terakhir."
+      continue
+    fi
+    echo "Chat yang ditemukan:"
+    i=0
+    for r in "${rows[@]}"; do
+      i=$((i+1)); IFS=$'\t' read -r cid ctype cname <<< "$r"
+      printf '  %d. %-16s %-10s %s\n' "$i" "$cid" "$ctype" "$cname"
+    done
+    read -r -p "Pilih nomor chat (kosong = cari ulang): " pick
+    [[ -n "$pick" ]] || continue
+    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#rows[@]} )); then
+      chat=$(cut -f1 <<< "${rows[$((pick-1))]}")
+      break
+    fi
+    echo "Pilihan tidak valid."
+  done
+  [[ "$chat" == "-" ]] && chat=$TG_CHAT_ID
+  [[ "$chat" =~ ^(-?[0-9]+|@[A-Za-z0-9_]{5,})$ ]] || { err "Chat ID tidak valid (angka; grup/channel diawali -100; atau @namachannel)."; return 1; }
+
+  echo
   echo "Kirim notifikasi kapan?"
   echo "  1. Hanya jika auto backup gagal"
   echo "  2. Setiap auto backup (berhasil maupun gagal)"
@@ -1246,17 +1393,20 @@ drop_database() {
   echo "Database aplikasi:"
   list_app_databases | sed 's/^/  - /'
   read -r -p "Nama database yang akan DIHAPUS: " db
-  valid_identifier "$db" || { err "Nama database tidak valid."; return 1; }
+  valid_dbname "$db" || { err "Nama database tidak valid."; return 1; }
   db_exists "$db" || { err "Database '$db' tidak ditemukan."; return 1; }
   case "$db" in mysql|information_schema|performance_schema|sys) err "Database sistem tidak boleh dihapus."; return 1 ;; esac
 
   # Di mysql.db, '_' pada nama database bisa tersimpan sebagai '\_' (escape wildcard).
   esc=${db//_/\\_}
+  # Versi aman-regex untuk dicocokkan di output SHOW GRANTS ('$' adalah metakarakter).
+  local dbre=${db//\$/\\\$} escre=${esc//\\/\\\\}
+  escre=${escre//\$/\\\$}
   while read -r u h; do
     [[ -n "$u" ]] || continue
     # User eksklusif = selain USAGE, hak aksesnya hanya ke database ini.
     grants=$(mysql_root -N -B --raw -e "SHOW GRANTS FOR $(sql_literal "$u")@$(sql_literal "$h")" \
-      | grep -vE '^GRANT USAGE ON \*\.\* TO ' | grep -vE "^GRANT .* ON \`($db|${esc//\\/\\\\})\`\.\* TO " || true)
+      | grep -vE '^GRANT USAGE ON \*\.\* TO ' | grep -vE "^GRANT .* ON \`($dbre|$escre)\`\.\* TO " || true)
     if [[ -z "$grants" ]]; then exclusive+=("$u@$h"); else shared+=("$u@$h"); fi
   done < <(mysql_q "SELECT DISTINCT user, host FROM mysql.db WHERE (db=$(sql_literal "$db") OR db=$(sql_literal "$esc")) AND user <> 'root' ORDER BY user, host")
 
@@ -1407,13 +1557,14 @@ rotate_ssl() {
   echo "Sertifikat lama disimpan di $bdir"
 
   before=$(served_not_after)
-  if mysql_root -e "ALTER INSTANCE RELOAD TLS" 2>/tmp/.mym-tls.$$; then
+  local errf; errf=$(mktemp)
+  if mysql_root -e "ALTER INSTANCE RELOAD TLS" 2>"$errf"; then
     after=$(served_not_after)
     echo "TLS dimuat ulang tanpa restart. Berlaku s.d. (dari server): ${after:-?}"
-    rm -f -- /tmp/.mym-tls.$$
+    rm -f -- "$errf"
   else
-    err "MySQL menolak sertifikat baru: $(head -n 1 /tmp/.mym-tls.$$)"
-    rm -f -- /tmp/.mym-tls.$$
+    err "MySQL menolak sertifikat baru: $(head -n 1 "$errf")"
+    rm -f -- "$errf"
     # Kembalikan persis seperti semula (owner & mode ikut, karena dibackup dengan cp -p).
     for f in ca.pem ca-key.pem server-cert.pem server-key.pem; do
       if [[ -f "$bdir/$f" ]]; then cp -p -- "$bdir/$f" "$DATA_DIR/$f"; fi
@@ -1674,7 +1825,7 @@ collect_backups() {
 pick_backup() {
   local filter rows=() r i=0 pick epoch src loc size name dbn path
   read -r -p "Filter nama database (kosong = semua): " filter
-  [[ -z "$filter" ]] || valid_identifier "$filter" || { err "Filter tidak valid."; return 1; }
+  [[ -z "$filter" ]] || valid_dbname "$filter" || { err "Filter tidak valid."; return 1; }
   echo "Mencari backup lokal$(r2_configured && echo ' dan R2')..." >&2
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
@@ -1870,14 +2021,14 @@ restore_database() {
   fi
 
   def_db=$(db_from_backup_name "$file")
-  if [[ -n "$def_db" ]] && valid_identifier "$def_db" && db_exists "$def_db"; then
+  if [[ -n "$def_db" ]] && valid_dbname "$def_db" && db_exists "$def_db"; then
     read -r -p "Restore ke database yang sudah ada [$def_db]: " db
     db=${db:-$def_db}
   else
     [[ -n "$def_db" ]] && echo "Database asal '$def_db' belum ada di server ini. Buat dulu lewat menu 5 jika ingin restore ke nama yang sama."
     read -r -p "Restore ke database yang sudah ada: " db
   fi
-  valid_identifier "$db" || { err "Nama database tidak valid."; return 1; }
+  valid_dbname "$db" || { err "Nama database tidak valid."; return 1; }
   db_exists "$db" || { err "Database '$db' tidak ada. Buat dulu lewat menu 5."; return 1; }
   case "$db" in mysql|information_schema|performance_schema|sys) err "Restore ke database sistem tidak diizinkan."; return 1 ;; esac
 
@@ -2033,6 +2184,10 @@ main_menu() {
       check_ownership
       cw=$(cert_expiry_warning 2>/dev/null || true)
       [[ -z "$cw" ]] || echo "PERINGATAN: $cw"
+      if [[ -f "$INSTALLED_BIN" ]] && { [[ -f "$CRON_FILE" ]] || [[ -f "/etc/systemd/system/$SYSTEMD_UNIT.timer" ]]; } \
+         && ! cmp -s "$SCRIPT_PATH" "$INSTALLED_BIN"; then
+        echo "PERINGATAN: salinan scheduler ($INSTALLED_BIN) berbeda dari script ini; buka menu auto backup -> 1 untuk memperbarui."
+      fi
     elif [[ -f "$COMPOSE_FILE" ]]; then
       echo "Status: compose.yaml ada tetapi .env tidak ditemukan/tidak valid"
     else

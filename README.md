@@ -408,22 +408,61 @@ Lokasi sertifikat: `data/ca.pem`, `data/server-cert.pem`, `data/server-key.pem` 
 
 ## Notifikasi Telegram
 
-Menu **13 → 8** (auto backup & R2):
+Menu **13 → 8** (auto backup & R2). Script memandu langkah berikut dan
+mencari chat ID secara otomatis.
 
-1.  Buat bot lewat **@BotFather** → dapatkan token (`123456:ABC...`).
-2.  Kirim pesan ke bot (atau tambahkan bot ke grup), lalu ambil chat ID dari
-    `https://api.telegram.org/bot<TOKEN>/getUpdates` (field `chat.id`; grup
-    biasanya diawali `-100`).
-3.  Isi token, chat ID, dan kapan dikirim: **hanya jika gagal** (default) atau
-    **setiap auto backup**. Pesan tes langsung dikirim.
+### Langkah 1 — Buat bot dan ambil token
+
+1.  Buka Telegram, cari **@BotFather** (akun resmi, bercentang biru), tekan
+    **Start**.
+2.  Kirim perintah `/newbot`.
+3.  Isi **nama** bot (bebas, mis. `Backup Server DB`).
+4.  Isi **username** bot, harus diakhiri `bot` (mis. `qolcore_backup_bot`).
+5.  BotFather membalas dengan **token**, contoh
+    `123456789:AAH4xYz...`. Salin token itu.
+
+> Rahasiakan token: siapa pun yang memilikinya bisa memakai bot Anda. Jika
+> bocor, kirim `/revoke` ke @BotFather untuk membuat token baru, lalu ulangi
+> menu 13 → 8.
+
+### Langkah 2 — Tentukan tujuan notifikasi (pilih salah satu)
+
+  Tujuan          Yang harus dilakukan
+  --------------- ------------------------------------------------------------------
+  Chat pribadi    Buka bot Anda (link `t.me/<username_bot>` dari BotFather), tekan **Start** atau kirim pesan apa saja
+  Grup            Tambahkan bot ke grup, lalu kirim di grup: `/start@<username_bot>`
+  Channel         Jadikan bot **admin** channel (izin *Post messages*), lalu buat satu postingan
+
+Bot tidak bisa mengirim pesan ke Anda sebelum langkah 2 dilakukan.
+
+### Langkah 3 — Isi di script
+
+1.  Tempel token (input tersembunyi). Script langsung mengecek token ke
+    Telegram dan menampilkan username bot.
+2.  Tekan Enter: script membaca pesan terbaru bot (`getUpdates`) dan
+    menampilkan daftar chat yang ditemukan (pribadi/grup/channel). Pilih
+    nomornya. Jika belum ada, lakukan langkah 2 lalu tekan Enter lagi.
+    Anda juga bisa mengetik chat ID manual.
+3.  Pilih kapan dikirim: **hanya jika gagal** (default) atau **setiap auto
+    backup**. Pesan tes langsung dikirim.
+
+Catatan:
+
+-   Telegram hanya menyimpan pesan untuk bot selama 24 jam; jika daftar kosong,
+    kirim pesan baru ke bot.
+-   Jika bot yang sama dipakai aplikasi lain dengan **webhook**, pencarian
+    otomatis tidak bisa dipakai (Telegram menolak `getUpdates`). Ketik chat ID
+    manual, atau buat bot khusus notifikasi.
+-   Grup biasanya memiliki chat ID diawali `-100`.
+
+### Isi pesan & keamanan
 
 Isi pesan: status (✅/❌), host, folder, container, ringkasan per database,
 status upload R2, baris error, dan peringatan sertifikat jika ada.
 
 -   Disimpan di `telegram.conf` (root, `600`). Token dikirim ke `curl` lewat
-    stdin sehingga tidak muncul di `ps`. Butuh `curl` di host.
--   Gagal mengirim notifikasi **tidak** mengubah status backup (backup sukses
-    tetap tercatat sukses).
+    stdin sehingga tidak muncul di `ps`. Butuh `curl` dan `python3` di host.
+-   Gagal mengirim notifikasi **tidak** mengubah status backup.
 -   Menu 13 → 9 mengirim pesan tes, 13 → 10 mematikan notifikasi.
 
 ## Uninstall instance
@@ -449,6 +488,30 @@ dan image Docker tidak dihapus.
 -   Data disimpan → instance bisa dinyalakan lagi dengan menu 2.
 -   Data dihapus → folder kembali ke kondisi "Belum setup" dan siap untuk
     setup baru (menu 1).
+
+## Keamanan folder proyek
+
+Auto backup berjalan sebagai **root** dan menulis ke folder proyek. Karena itu:
+
+-   Folder proyek dan `backups/` harus **milik root** dan tidak bisa ditulis
+    user lain. Jika tidak, auto backup **menolak berjalan** (dan notifikasi
+    Telegram mengirim status gagal), dan menu utama menampilkan peringatan
+    beserta perintah perbaikannya:
+
+    ``` bash
+    sudo chown root:root /opt/folder-proyek && sudo chmod go-w /opt/folder-proyek
+    ```
+
+    Alasannya: user yang bisa mengubah folder itu bisa membelokkan file lewat
+    symlink sehingga proses root menimpa file sistem.
+-   `backups/` yang berupa symlink ditolak.
+-   Penguncian (agar dua backup tidak berjalan bersamaan) memakai folder proyek
+    itu sendiri, tanpa file lock yang bisa dimanipulasi.
+-   Setup menulis `COMPOSE_PROJECT_NAME` unik per folder di `.env`, sehingga
+    dua instance di folder dengan nama sama (mis. `/opt/a/db` dan `/opt/b/db`)
+    tidak saling menimpa container.
+-   Jika script diperbarui sementara jadwal backup aktif, menu menampilkan
+    peringatan bahwa salinan di `/usr/local/sbin` masih versi lama.
 
 ## Koneksi dan SSL
 
