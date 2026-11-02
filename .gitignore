@@ -15,3 +15,5 @@ backups/
 telegram.conf
 .tgconf.*
 .ssl.*
+remotes/
+.profile.*
