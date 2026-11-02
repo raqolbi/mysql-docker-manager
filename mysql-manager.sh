@@ -493,7 +493,7 @@ do_backup() {
   log "Backup '$db' -> $file"
   # --single-transaction: snapshot konsisten untuk InnoDB tanpa mengunci tabel.
   if ! MYSQL_PWD="$MYSQL_ROOT_PASSWORD" docker exec -e MYSQL_PWD "$MYSQL_CONTAINER" \
-        mysqldump -uroot --single-transaction --quick --routines --triggers --events \
+        mysqldump -uroot --max-allowed-packet=1G --single-transaction --quick --routines --triggers --events \
         --hex-blob --set-gtid-purged=OFF --no-tablespaces --default-character-set=utf8mb4 \
         "$db" | gzip -6 > "$tmp"; then
     rm -f -- "$tmp"; err "mysqldump '$db' gagal; file parsial dihapus."; return 1
@@ -1136,12 +1136,12 @@ load_profile() {
     [[ "$line" == *=* && "$line" != \#* ]] || continue
     key=${line%%=*}; value=${line#*=}
     case "$key" in
-      R_HOST)      if [[ "$value" =~ ^[A-Za-z0-9._:-]{1,253}$ ]]; then R_HOST=$value; fi ;;
+      R_HOST)      if [[ "$value" =~ ^[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}$ ]]; then R_HOST=$value; fi ;;
       R_PORT)      if [[ "$value" =~ ^[0-9]{1,5}$ ]]; then R_PORT=$value; fi ;;
       R_USER)      if [[ "$value" =~ ^[A-Za-z0-9_.@-]{1,128}$ ]]; then R_USER=$value; fi ;;
       R_PASSWORD)  R_PASSWORD=$value ;;
       R_SSLMODE)   if [[ " $REMOTE_SSL_MODES " == *" $value "* ]]; then R_SSLMODE=$value; fi ;;
-      R_CA)        if [[ -z "$value" || "$value" == system || -f "$value" ]]; then R_CA=$value; fi ;;
+      R_CA)        if [[ -z "$value" || "$value" == system || "$value" =~ ^/[^:,]+$ ]]; then R_CA=$value; fi ;;
       R_MAINTDB)   if valid_dbname "$value"; then R_MAINTDB=$value; fi ;;
       R_DATABASES) if [[ "$value" == all || "$value" =~ ^[A-Za-z0-9_\$-]+(,[A-Za-z0-9_\$-]+)*$ ]]; then R_DATABASES=$value; fi ;;
       R_AUTO)      if [[ "$value" == yes || "$value" == no ]]; then R_AUTO=$value; fi ;;
@@ -1203,8 +1203,12 @@ rprofile_edit() {
   read -r -p "Nama profil (huruf kecil/angka/-/_, mis. neon-prod): " name
   valid_profile "$name" || { err "Nama profil tidak valid."; return 1; }
   if [[ -f "$REMOTE_DIR/$name.conf" ]]; then
-    load_profile "$name" || return 1
-    echo "Mengubah profil '$name'. Kosongkan isian untuk memakai nilai lama."
+    if load_profile "$name" 2>/dev/null; then
+      echo "Mengubah profil '$name'. Kosongkan isian untuk memakai nilai lama."
+    else
+      R_NAME=$name
+      echo "Profil '$name' tidak lengkap/rusak; lengkapi isian di bawah untuk memperbaikinya."
+    fi
   else
     isnew=1
     R_NAME=$name R_HOST="" R_PORT="3306" R_USER="" R_PASSWORD="" R_SSLMODE="REQUIRED" R_CA=""
@@ -1219,7 +1223,7 @@ Untuk restore: hak membuat/menghapus tabel, view, routine, trigger di database t
 Server tujuan harus bisa dijangkau dari server ini (cek firewall/allowlist IP).
 EOF
   read -r -p "Host (domain/IP) [${R_HOST}]: " v; v=${v:-$R_HOST}
-  [[ "$v" =~ ^[A-Za-z0-9._:-]{1,253}$ ]] || { err "Host tidak valid."; return 1; }
+  [[ "$v" =~ ^[A-Za-z0-9:][A-Za-z0-9._:-]{0,252}$ ]] || { err "Host tidak valid."; return 1; }
   R_HOST=$v
   read -r -p "Port [${R_PORT}]: " v; v=${v:-$R_PORT}
   [[ "$v" =~ ^[0-9]{1,5}$ ]] && (( 10#$v >= 1 && 10#$v <= 65535 )) || { err "Port tidak valid."; return 1; }
@@ -1236,13 +1240,21 @@ EOF
   [[ -n "$R_PASSWORD" ]] || { err "Password wajib diisi."; return 1; }
   echo "Mode SSL: $REMOTE_SSL_MODES"
     echo "  DISABLED=tanpa SSL | PREFERRED=SSL jika ada | REQUIRED=terenkripsi, tanpa verifikasi |"
-  echo "  VERIFY_CA=cek CA (isi file CA) | VERIFY_IDENTITY=cek CA + nama host (paling aman)."
+  echo "  VERIFY_CA=cek CA | VERIFY_IDENTITY=cek CA + nama host (paling aman; file CA kosong = CA bawaan OS)."
   read -r -p "Mode SSL [${R_SSLMODE}]: " v; v=${v:-$R_SSLMODE}
   [[ " $REMOTE_SSL_MODES " == *" $v "* ]] || { err "Mode SSL tidak dikenal."; return 1; }
   R_SSLMODE=$v
-  read -r -p "File CA untuk verifikasi (kosong = tidak ada${R_CA:+, '-' = hapus}; 'system' = CA bawaan OS) [${R_CA}]: " v
+  if [[ "${v,,}" == disable* ]]; then
+    echo "PERINGATAN: tanpa SSL, isi database (termasuk hasil backup) lewat jaringan tanpa enkripsi."
+    echo "            Pakai hanya untuk jaringan privat/VPN."
+  fi
+  read -r -p "File CA (kosong/'system' = CA bawaan OS, cocok untuk layanan managed${R_CA:+; '-' = hapus}) [${R_CA}]: " v
   if [[ "$v" == "-" ]]; then R_CA=""; elif [[ -n "$v" ]]; then
-    if [[ "$v" != system ]]; then v=$(expand_path "$v"); [[ -r "$v" ]] || { err "File CA tidak bisa dibaca: $v"; return 1; }; fi
+    if [[ "$v" != system ]]; then
+      v=$(expand_path "$v"); [[ -r "$v" && -f "$v" ]] || { err "File CA tidak bisa dibaca: $v"; return 1; }
+      v=$(readlink -f -- "$v")
+      [[ "$v" =~ ^/[^:,]+$ ]] || { err "Path file CA tidak boleh mengandung ':' atau ','; pindahkan filenya."; return 1; }
+    fi
     R_CA=$v
   fi
   
@@ -1434,25 +1446,47 @@ rc_conn_args() {
   local ca=$1
   RC_ARGS=(--host="$R_HOST" --port="$R_PORT" --user="$R_USER" --default-character-set=utf8mb4)
   RC_ARGS+=(--ssl-mode="$R_SSLMODE")
-  if [[ -n "$ca" && "$ca" != system ]]; then RC_ARGS+=(--ssl-ca="$ca"); fi
+  if [[ -n "$ca" ]]; then RC_ARGS+=(--ssl-ca="$ca"); fi
 }
 
 # rc_exec <host|docker> <image> <tool> [args...]; password lewat MYSQL_PWD (bukan argumen).
 rc_exec() {
   local mode=$1 image=$2 tool=$3; shift 3
+  rc_ca_file || return 1
+  # Batas waktu koneksi (hanya klien CLI yang punya opsi ini; probe selalu lewat CLI).
+  local -a extra=()
+  if [[ "$tool" == "$R_CLI" ]]; then extra=(--connect-timeout=15); fi
   if [[ "$mode" == host ]]; then
-    rc_conn_args "$R_CA"
-    MYSQL_PWD="$R_PASSWORD" "$tool" "${RC_ARGS[@]}" "$@"
+    rc_conn_args "$RC_CA_FILE"
+    MYSQL_PWD="$R_PASSWORD" "$tool" "${RC_ARGS[@]}" "${extra[@]}" "$@"
   else
     local -a dargs=(--rm -i --network host -e MYSQL_PWD)
-    if [[ -n "$R_CA" && "$R_CA" != system ]]; then
-      dargs+=(-v "$R_CA:/tmp/remote-ca.pem:ro"); rc_conn_args /tmp/remote-ca.pem
+    if [[ -n "$RC_CA_FILE" ]]; then
+      dargs+=(-v "$RC_CA_FILE:/tmp/remote-ca.pem:ro"); rc_conn_args /tmp/remote-ca.pem
     else
-      rc_conn_args "$R_CA"
+      rc_conn_args ""
     fi
     ensure_image "$image" || return 1
-    MYSQL_PWD="$R_PASSWORD" docker run "${dargs[@]}" --entrypoint "$tool" "$image" "${RC_ARGS[@]}" "$@"
+    MYSQL_PWD="$R_PASSWORD" docker run "${dargs[@]}" --entrypoint "$tool" "$image" "${RC_ARGS[@]}" "${extra[@]}" "$@"
   fi
+}
+
+# File CA efektif untuk koneksi -> RC_CA_FILE (kosong = tanpa CA).
+# Mode verifikasi tanpa file CA / dengan 'system' memakai bundle CA OS di host
+# (di-mount ke container), sehingga berlaku sama untuk klien host maupun Docker.
+rc_ca_file() {
+  RC_CA_FILE=""
+  if [[ -n "$R_CA" && "$R_CA" != system ]]; then
+    [[ -r "$R_CA" ]] || { err "File CA profil '$R_NAME' tidak ditemukan / tidak bisa dibaca: $R_CA"; return 1; }
+    RC_CA_FILE=$R_CA; return 0
+  fi
+  case "${R_SSLMODE,,}" in verify*) ;; *) return 0 ;; esac
+  local f
+  for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/ca-bundle.pem /etc/ssl/cert.pem; do
+    if [[ -r "$f" ]]; then RC_CA_FILE=$(readlink -f -- "$f"); return 0; fi
+  done
+  err "Bundle CA sistem tidak ditemukan (pasang paket ca-certificates) atau isi file CA di profil."
+  return 1
 }
 
 # Pastikan image klien tersedia (pull senyap), supaya pesan pull tidak tercampur output.
@@ -1487,7 +1521,7 @@ rc_probe_client() {
   fi
 }
 
-rc_q() { rc_probe_client; rc_exec "$PROBE_MODE" "$PROBE_IMAGE" "$R_CLI" -N -B -e "$1"; }
+rc_q() { rc_probe_client; rc_exec "$PROBE_MODE" "$PROBE_IMAGE" "$R_CLI" -N -B -e "$1" < /dev/null; }
 
 ver_ge() { # ver_ge <a.b> <c.d>  -> a.b >= c.d
   local a1=${1%%.*} a2=${1#*.} b1=${2%%.*} b2=${2#*.}
@@ -1496,6 +1530,7 @@ ver_ge() { # ver_ge <a.b> <c.d>  -> a.b >= c.d
 
 rb_probe() {
   local out errf
+  rc_ca_file || return 1
   errf=$(mktemp)
   if ! out=$(rc_q "SELECT VERSION()" 2>"$errf"); then
     err "Gagal terhubung ke $R_HOST:$R_PORT sebagai $R_USER: $(grep -m1 -E 'ERROR|error' "$errf" || head -n1 "$errf")"
@@ -1566,6 +1601,7 @@ rc_dump_extra() {
 
 rb_backup_db() {
   local db=$1 dir=$2 ts file tmp
+  valid_dbname "$db" || { err "Remote $R_NAME: nama database '$db' tidak didukung (hanya huruf, angka, _ \$ -); dilewati."; return 1; }
   [[ -n "$RS_MAJOR" ]] || rb_probe >/dev/null || return 1
   [[ -n "$RC_MODE" ]] || rc_select "$RS_MAJOR" || return 1
   rc_dump_extra
@@ -1574,7 +1610,7 @@ rb_backup_db() {
   file="$dir/${db}-${ts}.sql.gz"; [[ -e "$file" ]] && file="$dir/${db}-${ts}-$$.sql.gz"
   tmp="$file.partial"
   log "Backup remote $R_NAME/$db -> $file"
-  if ! rc_run "$R_DUMP" --single-transaction --quick --routines --triggers --events --hex-blob \
+  if ! rc_run "$R_DUMP" --max-allowed-packet=1G --single-transaction --quick --routines --triggers --events --hex-blob \
         --no-tablespaces "${RC_EXTRA[@]}" "$db" | gzip -6 > "$tmp"; then
     rm -f -- "$tmp"; err "$R_DUMP $R_NAME/$db gagal; file parsial dihapus."; return 1
   fi
@@ -1679,7 +1715,7 @@ rb_restore_remote() {
     if (( genfix )); then dump_cat "$file" | python3 -c "$GENFIX_PY" fix; else dump_cat "$file"; fi
   } | sed '1{/enable the sandbox mode/d}' | {
     if (( defmode )); then sed -E 's/DEFINER=`[^`]+`@`[^`]+`/DEFINER=CURRENT_USER/g'; else cat; fi
-  } | rc_run "$R_CLI" "$db" || {
+  } | rc_run "$R_CLI" --max-allowed-packet=1G "$db" || {
     err "Restore gagal. $R_NAME/$db mungkin hanya ter-restore sebagian; kembalikan dari backup pengaman jika perlu."
     return 1
   }
@@ -2455,7 +2491,8 @@ collect_backups() {
         fi
       done
     fi
-  } | awk -F'|' '!($5 in best) || ($2 ~ /^lokal/ && src[$5] !~ /^lokal/) { best[$5] = $0; src[$5] = $2 }
+  } | awk -F'|' '{ n = split($2, a, ":"); p = ($2 ~ /^lokal/) ? (n > 1 ? a[2] : "") : (n > 2 ? a[3] : ""); k = p "/" $5 }
+                 !(k in best) || ($2 ~ /^lokal/ && src[k] !~ /^lokal/) { best[k] = $0; src[k] = $2 }
                  END { for (k in best) print best[k] }' | sort -t'|' -k1,1nr
 }
 
@@ -2728,7 +2765,7 @@ restore_database() {
     if (( genfix )); then dump_cat "$file" | python3 -c "$GENFIX_PY" fix; else dump_cat "$file"; fi
   } | sed '1{/enable the sandbox mode/d}' | {
     if [[ -n "$new_def" ]]; then sed -E "s/DEFINER=\`[^\`]+\`@\`[^\`]+\`/$new_def/g"; else cat; fi
-  } | mysql_root "$db" || {
+  } | mysql_root --max-allowed-packet=1G "$db" || {
     err "Restore gagal. Database '$db' mungkin hanya ter-restore sebagian."
     [[ "${pre,,}" != "n" ]] && err "Kembalikan dari backup pengaman di atas (menu 7) jika perlu."
     return 1
