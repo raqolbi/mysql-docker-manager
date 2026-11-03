@@ -550,7 +550,7 @@ PICK_NOTES=()
 pick_many() {
   local prompt=$1 empty=$2 strict=$3; shift 3
   local -a items=("$@") toks=(); local in t i found x
-  PICKED=() PICK_DEFAULT=0
+  PICKED=() PICK_DEFAULT=0 PICK_ALL=0
   for i in "${!items[@]}"; do printf '  %2d. %s%s\n' "$((i+1))" "${items[$i]}" "${PICK_NOTES[$i]:+  (${PICK_NOTES[$i]})}"; done
   PICK_NOTES=()
   echo "Isi: all = semua | nomor atau nama, pisahkan dengan koma (mis. 1,3 atau ${items[0]:-nama})"
@@ -564,6 +564,7 @@ pick_many() {
   for t in "${toks[@]}"; do
     [[ -n "$t" ]] || continue
     if [[ "${t,,}" == all ]]; then
+      PICK_ALL=1
       for x in "${items[@]}"; do [[ " ${PICKED[*]} " == *" $x "* ]] || PICKED+=("$x"); done
       continue
     fi
@@ -580,6 +581,11 @@ pick_many() {
     [[ " ${PICKED[*]} " == *" $found "* ]] || PICKED+=("$found")
   done
   (( ${#PICKED[@]} > 0 )) || { err "Tidak ada yang dipilih."; return 1; }
+}
+
+# Ubah hasil pick_many menjadi nilai konfigurasi: "all" (dinamis) atau "db1,db2".
+picked_to_list() {
+  if (( PICK_ALL )); then echo all; else local IFS=','; echo "${PICKED[*]}"; fi
 }
 
 backup_database() {
@@ -857,7 +863,7 @@ load_backup_conf() {
   while IFS='=' read -r key value || [[ -n "$key" ]]; do
     key=${key//[[:space:]]/}; value=${value//$'\r'/}
     case "$key" in
-      BACKUP_DATABASES)      if [[ "$value" =~ ^[A-Za-z0-9_,]+$ ]]; then BACKUP_DATABASES=$value; fi ;;
+      BACKUP_DATABASES)      if [[ "$value" =~ ^[A-Za-z0-9_$,-]+$ ]]; then BACKUP_DATABASES=$value; fi ;;
       BACKUP_RETENTION_DAYS) if [[ "$value" =~ ^[0-9]+$ ]]; then BACKUP_RETENTION_DAYS=$value; fi ;;
       BACKUP_TIME)           if [[ "$value" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]; then BACKUP_TIME=$value; fi ;;
       BACKUP_TARGET)         if [[ "$value" =~ ^(local|r2|both)$ ]]; then BACKUP_TARGET=$value; fi ;;
@@ -1017,10 +1023,18 @@ schedule_enable() {
   read -r -p "Jam backup harian (HH:MM, zona waktu server) [$BACKUP_TIME]: " t; t=${t:-$BACKUP_TIME}
   [[ "$t" =~ ^([01][0-9]|2[0-3]):([0-5][0-9])$ ]] || { err "Format jam harus HH:MM."; return 1; }
   hh=${BASH_REMATCH[1]}; mm=${BASH_REMATCH[2]}
-  echo "Database: 'all' = semua database aplikasi (termasuk yang dibuat nanti), atau daftar dipisah koma."
-  read -r -p "Database [$BACKUP_DATABASES]: " d; d=${d:-$BACKUP_DATABASES}
-  d=${d// /}
-  [[ "$d" == "all" || "$d" =~ ^[A-Za-z_][A-Za-z0-9_]*(,[A-Za-z_][A-Za-z0-9_]*)*$ ]] || { err "Daftar database tidak valid."; return 1; }
+  local -a avail=(); local rc
+  if [[ -f "$ENV_FILE" ]] && container_running 2>/dev/null; then mapfile -t avail < <(list_app_databases); fi
+  echo "Database instance lokal untuk auto backup ('all' = semua, termasuk yang dibuat nanti):"
+  if (( ${#avail[@]} > 0 )); then
+    rc=0; pick_many "Database" "tetap: $BACKUP_DATABASES" 0 "${avail[@]}" || rc=$?
+    (( rc == 0 )) || return 1
+    if (( PICK_DEFAULT )); then d=$BACKUP_DATABASES; else d=$(picked_to_list); fi
+  else
+    read -r -p "Database: 'all' atau nama dipisah koma [$BACKUP_DATABASES]: " d; d=${d:-$BACKUP_DATABASES}
+  fi
+  d=${d//[[:space:]]/}
+  [[ "$d" == "all" || "$d" =~ ^[A-Za-z0-9_][A-Za-z0-9_\$-]*(,[A-Za-z0-9_][A-Za-z0-9_\$-]*)*$ ]] || { err "Daftar database tidak valid."; return 1; }
   echo "Tujuan backup:"
   echo "  1. Lokal saja"
   echo "  2. R2 saja   (dump dibuat lokal sementara, dihapus setelah upload berhasil)"
@@ -1304,7 +1318,18 @@ EOF
     R_CA=$v
   fi
   
-  read -r -p "Database yang di-backup: 'all' atau daftar dipisah koma [${R_DATABASES}]: " v; v=${v:-$R_DATABASES}; v=${v// /}
+  local -a avail=(); local rc
+  echo "Membaca daftar database dari server..."
+  if rb_probe >/dev/null 2>&1; then mapfile -t avail < <(rb_list_dbs 2>/dev/null); fi
+  if (( ${#avail[@]} > 0 )); then
+    echo "Database yang di-backup ('all' = semua, termasuk yang dibuat nanti):"
+    rc=0; pick_many "Database" "tetap: $R_DATABASES" 1 "${avail[@]}" || rc=$?
+    (( rc == 0 )) || return 1
+    if (( PICK_DEFAULT )); then v=$R_DATABASES; else v=$(picked_to_list); fi
+  else
+    echo "(Daftar database belum bisa dibaca; cek koneksi setelah profil disimpan.)"
+    read -r -p "Database yang di-backup: 'all' atau daftar dipisah koma [${R_DATABASES}]: " v; v=${v:-$R_DATABASES}; v=${v// /}
+  fi
   [[ "$v" == all || "$v" =~ ^[A-Za-z0-9_\$-]+(,[A-Za-z0-9_\$-]+)*$ ]] || { err "Daftar database tidak valid."; return 1; }
   R_DATABASES=$v
   read -r -p "Ikut auto backup terjadwal (menu auto backup)? yes/no [${R_AUTO}]: " v; v=${v:-$R_AUTO}
