@@ -539,25 +539,63 @@ list_app_databases() {
   mysql_q "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ($SYSTEM_SCHEMAS) ORDER BY schema_name"
 }
 
+# Pilih beberapa item dari daftar bernomor.
+# pick_many <prompt> <arti_kosong> <strict:0|1> item...
+#   Input: all = semua; nomor dan/atau nama dipisah koma (mis. 1,3 atau shop,app).
+#   Hasil di PICKED (urut sesuai input, tanpa duplikat). Input kosong:
+#   PICK_DEFAULT=1 jika <arti_kosong> diisi, selain itu return 2 (batal).
+#   strict=0: nama yang tidak ada di daftar tetap diterima (dicek pemanggil).
+#   PICK_NOTES (opsional, diisi pemanggil): keterangan per item, ditampilkan di belakangnya.
+PICK_NOTES=()
+pick_many() {
+  local prompt=$1 empty=$2 strict=$3; shift 3
+  local -a items=("$@") toks=(); local in t i found x
+  PICKED=() PICK_DEFAULT=0
+  for i in "${!items[@]}"; do printf '  %2d. %s%s\n' "$((i+1))" "${items[$i]}" "${PICK_NOTES[$i]:+  (${PICK_NOTES[$i]})}"; done
+  PICK_NOTES=()
+  echo "Isi: all = semua | nomor atau nama, pisahkan dengan koma (mis. 1,3 atau ${items[0]:-nama})"
+  read -r -p "$prompt${empty:+ (kosong = $empty)}: " in
+  in=${in//[[:space:]]/}
+  if [[ -z "$in" ]]; then
+    [[ -n "$empty" ]] || return 2
+    PICK_DEFAULT=1; return 0
+  fi
+  IFS=',' read -r -a toks <<< "$in"
+  for t in "${toks[@]}"; do
+    [[ -n "$t" ]] || continue
+    if [[ "${t,,}" == all ]]; then
+      for x in "${items[@]}"; do [[ " ${PICKED[*]} " == *" $x "* ]] || PICKED+=("$x"); done
+      continue
+    fi
+    found=""
+    if [[ "$t" =~ ^[0-9]+$ ]] && (( 10#$t >= 1 && 10#$t <= ${#items[@]} )); then
+      found=${items[$((10#$t - 1))]}
+    else
+      for x in "${items[@]}"; do [[ "$x" == "$t" ]] && { found=$x; break; }; done
+    fi
+    if [[ -z "$found" ]]; then
+      if (( strict )) || [[ "$t" =~ ^[0-9]+$ ]]; then err "'$t' tidak ada di daftar."; return 1; fi
+      found=$t
+    fi
+    [[ " ${PICKED[*]} " == *" $found "* ]] || PICKED+=("$found")
+  done
+  (( ${#PICKED[@]} > 0 )) || { err "Tidak ada yang dipilih."; return 1; }
+}
+
 backup_database() {
   require_running || return 1
-  local db file failed=0 files=() up
-  read -r -p "Nama database yang akan di-backup (kosong = semua database aplikasi): " db
-  if [[ -z "$db" ]]; then
-    local d dbs=()
-    mapfile -t dbs < <(list_app_databases)
-    (( ${#dbs[@]} > 0 )) || { err "Tidak ada database aplikasi."; return 1; }
-    for d in "${dbs[@]}"; do
-      [[ -n "$d" ]] || continue
-      if file=$(do_backup "$d"); then echo "OK    $file ($(du -h "$file" | cut -f1))"; files+=("$file"); else echo "GAGAL $d"; failed=1; fi
-    done
-  else
-    valid_dbname "$db" || { err "Nama database tidak valid."; return 1; }
-    db_exists "$db" || { err "Database '$db' tidak ditemukan."; return 1; }
-    file=$(do_backup "$db") || return 1
-    files+=("$file")
-    echo "Backup selesai: $file ($(du -h "$file" | cut -f1))"
-  fi
+  local d file failed=0 files=() up dbs=() rc
+  mapfile -t dbs < <(list_app_databases)
+  (( ${#dbs[@]} > 0 )) || { err "Tidak ada database aplikasi. Buat dulu lewat menu 'Buat database + user baru'."; return 1; }
+  echo "Database aplikasi:"
+  rc=0; pick_many "Database yang di-backup" "semua" 0 "${dbs[@]}" || rc=$?
+  (( rc != 2 )) || { echo "Dibatalkan."; return 0; }
+  (( rc == 0 )) || return 1
+  (( PICK_DEFAULT )) && PICKED=("${dbs[@]}")
+  for d in "${PICKED[@]}"; do
+    if ! valid_dbname "$d" || ! db_exists "$d"; then echo "GAGAL $d (database tidak ditemukan)"; failed=1; continue; fi
+    if file=$(do_backup "$d"); then echo "OK    $file ($(du -h "$file" | cut -f1))"; files+=("$file"); else echo "GAGAL $d"; failed=1; fi
+  done
   if file=$(do_users_backup); then files+=("$file"); fi
   if (( ${#files[@]} > 0 )) && r2_configured; then
     read -r -p "Upload juga ke R2 (folder manual/)? [y/N]: " up
@@ -1290,6 +1328,36 @@ rprofile_delete() {
   echo "Profil '$PICKED_PROFILE' dihapus. Backup di $RBACKUP_DIR/$PICKED_PROFILE dan $RAUTO_DIR/$PICKED_PROFILE tetap ada."
 }
 
+# Atur ikut/tidak ikut auto backup untuk banyak profil sekaligus.
+rprofile_set_auto() {
+  local -a ps=() names=(); local p v rc changed=0
+  mapfile -t ps < <(list_profiles)
+  (( ${#ps[@]} > 0 )) || { err "Belum ada profil server remote."; return 1; }
+  local -a notes=()
+  for p in "${ps[@]}"; do
+    if load_profile "$p" 2>/dev/null; then names+=("$p"); notes+=("auto: $R_AUTO"); fi
+  done
+  (( ${#names[@]} > 0 )) || { err "Semua profil rusak; perbaiki lewat 'Tambah / ubah profil'."; return 1; }
+  echo "Profil server remote:"
+  PICK_NOTES=("${notes[@]}")
+  rc=0; pick_many "Profil yang diubah" "" 1 "${names[@]}" || rc=$?
+  (( rc != 2 )) || { echo "Dibatalkan."; return 0; }
+  (( rc == 0 )) || return 1
+  read -r -p "Ikut auto backup terjadwal? yes/no: " v
+  v=${v,,}; [[ "$v" == y ]] && v=yes; [[ "$v" == n ]] && v=no
+  [[ "$v" == yes || "$v" == no ]] || { err "Isi yes atau no."; return 1; }
+  for p in "${PICKED[@]}"; do
+    load_profile "$p" || continue
+    if [[ "$R_AUTO" == "$v" ]]; then echo "  $p: sudah '$v'"; continue; fi
+    R_AUTO=$v; save_profile "$p"; changed=$((changed+1))
+    echo "  $p: auto -> $v"
+  done
+  echo "$changed profil diubah."
+  if [[ "$v" == yes ]] && [[ ! -f "$CRON_FILE" && ! -f "/etc/systemd/system/$SYSTEMD_UNIT.timer" ]]; then
+    echo "Catatan: jadwal auto backup belum aktif. Aktifkan di menu 'Auto backup & Cloudflare R2'."
+  fi
+}
+
 rprofile_test() { pick_profile "Pilih profil yang dites" || return 1; rb_test; }
 
 # Daftar database yang di-backup untuk profil aktif (R_DATABASES atau semua yang terlihat).
@@ -1302,17 +1370,23 @@ profile_db_list() {
 }
 
 remote_backup_now() {
-  local db file failed=0 up dbs=() files=() d dir
+  local file failed=0 up dbs=() files=() d dir avail=() rc
   pick_profile "Pilih profil yang di-backup" || return 1
   rb_probe || return 1
-  echo "Database di server ini:"
-  rb_list_dbs | sed 's/^/  - /'
-  read -r -p "Database yang di-backup (kosong = sesuai profil: $R_DATABASES): " db
-  if [[ -n "$db" ]]; then
-    valid_dbname "$db" || { err "Nama database tidak valid."; return 1; }
-    dbs=("$db")
+  mapfile -t avail < <(rb_list_dbs)
+  if (( ${#avail[@]} > 0 )); then
+    echo "Database di server ini:"
+    rc=0; pick_many "Database yang di-backup" "sesuai profil: $R_DATABASES" 1 "${avail[@]}" || rc=$?
+    (( rc != 2 )) || { echo "Dibatalkan."; return 0; }
+    (( rc == 0 )) || return 1
   else
+    echo "Daftar database tidak bisa dibaca; memakai daftar di profil ($R_DATABASES)."
+    PICK_DEFAULT=1
+  fi
+  if (( PICK_DEFAULT )); then
     mapfile -t dbs < <(profile_db_list)
+  else
+    dbs=("${PICKED[@]}")
   fi
   (( ${#dbs[@]} > 0 )) || { err "Tidak ada database untuk di-backup."; return 1; }
   dir="$RBACKUP_DIR/$R_NAME"
@@ -1430,6 +1504,7 @@ remote_menu() {
   echo "  3. Backup sekarang"
   echo "  4. Restore (ke server remote atau instance lokal)"
   echo "  5. Hapus profil"
+  echo "  6. Atur auto backup (yes/no) untuk satu, beberapa, atau semua profil"
   echo "  0. Kembali"
   echo "Auto backup terjadwal untuk profil dengan 'auto: yes' berjalan bersama jadwal di menu auto backup."
   read -r -p "Pilihan: " c
@@ -1439,6 +1514,7 @@ remote_menu() {
     3) remote_backup_now ;;
     4) remote_restore_now ;;
     5) rprofile_delete ;;
+    6) rprofile_set_auto ;;
     *) return 0 ;;
   esac
 }

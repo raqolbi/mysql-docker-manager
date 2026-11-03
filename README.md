@@ -175,8 +175,8 @@ dan tidak disimpan ke file.
 
 ## Backup database
 
-Menu **6**: masukkan nama database, atau kosongkan untuk semua database
-aplikasi.
+Menu **6**: database ditampilkan bernomor. Pilihan database ditampilkan bernomor. Isi `all` (semua), nomor atau nama yang dipisah koma
+(mis. `1,3` atau `shop,app`), atau kosongkan untuk semua database aplikasi.
 
 ``` text
 /opt/mysql/backups/NAMA_DATABASE-YYYYMMDD-HHMMSS.sql.gz
@@ -487,7 +487,13 @@ wajib** di-setup: `mysql-manager.sh` bisa dipakai murni sebagai tool backup.
   3. Backup sekarang
   4. Restore (ke server remote atau instance lokal)
   5. Hapus profil
+  6. Atur auto backup (yes/no) untuk satu, beberapa, atau semua profil
 ```
+
+**Backup sekarang** menampilkan database di server bernomor: isi `all`, nomor atau nama
+dipisah koma (mis. `1,3`), atau kosongkan untuk memakai daftar database di profil.
+Menu **6** mengubah status auto backup banyak profil sekaligus (pilih `all`, nomor,
+atau nama dipisah koma, lalu `yes`/`no`) tanpa membuka form ubah profil.
 
 ### Profil server
 
