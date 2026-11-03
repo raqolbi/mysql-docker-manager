@@ -553,7 +553,11 @@ pick_many() {
   PICKED=() PICK_DEFAULT=0 PICK_ALL=0
   for i in "${!items[@]}"; do printf '  %2d. %s%s\n' "$((i+1))" "${items[$i]}" "${PICK_NOTES[$i]:+  (${PICK_NOTES[$i]})}"; done
   PICK_NOTES=()
-  echo "Isi: all = semua | nomor atau nama, pisahkan dengan koma (mis. 1,3 atau ${items[0]:-nama})"
+  if (( ${#items[@]} >= 2 )); then
+    echo "Isi: all = semua | nomor atau nama, pisahkan dengan koma (mis. 1,2 atau ${items[0]},${items[1]})"
+  else
+    echo "Isi: all = semua | nomor atau nama (mis. 1 atau ${items[0]:-nama})"
+  fi
   read -r -p "$prompt${empty:+ (kosong = $empty)}: " in
   in=${in//[[:space:]]/}
   if [[ -z "$in" ]]; then
