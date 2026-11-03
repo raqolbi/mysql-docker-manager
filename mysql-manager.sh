@@ -1395,17 +1395,55 @@ profile_db_list() {
 }
 
 remote_backup_now() {
-  local file failed=0 up dbs=() files=() d dir avail=() rc
-  pick_profile "Pilih profil yang di-backup" || return 1
+  local -a ps=() names=() notes=() sel=(); local p rc failed=0 up="" ok=0
+  mapfile -t ps < <(list_profiles)
+  (( ${#ps[@]} > 0 )) || { err "Belum ada profil server remote. Tambahkan lewat menu 'Tambah / ubah profil'."; return 1; }
+  for p in "${ps[@]}"; do
+    if load_profile "$p" 2>/dev/null; then names+=("$p"); notes+=("$R_USER@$R_HOST:$R_PORT, db: $R_DATABASES"); fi
+  done
+  (( ${#names[@]} > 0 )) || { err "Semua profil rusak; perbaiki lewat 'Tambah / ubah profil'."; return 1; }
+  echo "Profil server remote:"
+  PICK_NOTES=("${notes[@]}")
+  rc=0; pick_many "Profil yang di-backup" "" 1 "${names[@]}" || rc=$?
+  (( rc != 2 )) || { echo "Dibatalkan."; return 0; }
+  (( rc == 0 )) || return 1
+  sel=("${PICKED[@]}")
+  # Satu profil: database bisa dipilih. Beberapa profil: database sesuai daftar di tiap profil.
+  if (( ${#sel[@]} == 1 )); then
+    remote_backup_profile "${sel[0]}" 1
+    return $?
+  fi
+  echo "Backup ${#sel[@]} profil; database mengikuti daftar di masing-masing profil."
+  if r2_configured; then
+    read -r -p "Upload juga ke R2 (folder manual/remote/<profil>/)? [y/N]: " up
+  fi
+  for p in "${sel[@]}"; do
+    echo
+    echo "=== $p ==="
+    if remote_backup_profile "$p" 0 "$up"; then ok=$((ok+1)); else failed=1; fi
+  done
+  echo
+  echo "Selesai: $ok dari ${#sel[@]} profil berhasil sepenuhnya."
+  (( failed == 0 ))
+}
+
+# remote_backup_profile <profil> <interaktif:0|1> [upload_r2:y|n]
+remote_backup_profile() {
+  local name=$1 interactive=$2 up=${3:-} file failed=0 dbs=() files=() d dir avail=() rc
+  load_profile "$name" || return 1
   rb_probe || return 1
-  mapfile -t avail < <(rb_list_dbs)
-  if (( ${#avail[@]} > 0 )); then
-    echo "Database di server ini:"
-    rc=0; pick_many "Database yang di-backup" "sesuai profil: $R_DATABASES" 1 "${avail[@]}" || rc=$?
-    (( rc != 2 )) || { echo "Dibatalkan."; return 0; }
-    (( rc == 0 )) || return 1
+  if (( interactive )); then
+    mapfile -t avail < <(rb_list_dbs)
+    if (( ${#avail[@]} > 0 )); then
+      echo "Database di server ini:"
+      rc=0; pick_many "Database yang di-backup" "sesuai profil: $R_DATABASES" 1 "${avail[@]}" || rc=$?
+      (( rc != 2 )) || { echo "Dibatalkan."; return 0; }
+      (( rc == 0 )) || return 1
+    else
+      echo "Daftar database tidak bisa dibaca; memakai daftar di profil ($R_DATABASES)."
+      PICK_DEFAULT=1
+    fi
   else
-    echo "Daftar database tidak bisa dibaca; memakai daftar di profil ($R_DATABASES)."
     PICK_DEFAULT=1
   fi
   if (( PICK_DEFAULT )); then
@@ -1413,7 +1451,7 @@ remote_backup_now() {
   else
     dbs=("${PICKED[@]}")
   fi
-  (( ${#dbs[@]} > 0 )) || { err "Tidak ada database untuk di-backup."; return 1; }
+  (( ${#dbs[@]} > 0 )) || { err "Remote $R_NAME: tidak ada database untuk di-backup."; return 1; }
   dir="$RBACKUP_DIR/$R_NAME"
   for d in "${dbs[@]}"; do
     [[ -n "$d" ]] || continue
@@ -1421,7 +1459,9 @@ remote_backup_now() {
   done
   if file=$(rb_backup_globals "$dir"); then files+=("$file"); fi
   if (( ${#files[@]} > 0 )) && r2_configured; then
-    read -r -p "Upload juga ke R2 (folder manual/remote/$R_NAME/)? [y/N]: " up
+    if (( interactive )); then
+      read -r -p "Upload juga ke R2 (folder manual/remote/$R_NAME/)? [y/N]: " up
+    fi
     if [[ "${up,,}" == "y" ]]; then
       if r2_upload_files "manual/remote/$R_NAME" "${files[@]}"; then echo "Upload ke R2 selesai."; else err "Upload ke R2 gagal; file lokal tetap ada."; failed=1; fi
     fi
@@ -1526,7 +1566,7 @@ remote_menu() {
   echo
   echo "  1. Tambah / ubah profil server"
   echo "  2. Tes koneksi profil"
-  echo "  3. Backup sekarang"
+  echo "  3. Backup sekarang (satu, beberapa, atau semua profil)"
   echo "  4. Restore (ke server remote atau instance lokal)"
   echo "  5. Hapus profil"
   echo "  6. Atur auto backup (yes/no) untuk satu, beberapa, atau semua profil"

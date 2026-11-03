@@ -484,14 +484,17 @@ wajib** di-setup: `mysql-manager.sh` bisa dipakai murni sebagai tool backup.
 ``` text
   1. Tambah / ubah profil server
   2. Tes koneksi profil
-  3. Backup sekarang
+  3. Backup sekarang (satu, beberapa, atau semua profil)
   4. Restore (ke server remote atau instance lokal)
   5. Hapus profil
   6. Atur auto backup (yes/no) untuk satu, beberapa, atau semua profil
 ```
 
-**Backup sekarang** menampilkan database di server bernomor: isi `all`, nomor atau nama
-dipisah koma (mis. `1,3`), atau kosongkan untuk memakai daftar database di profil.
+**Backup sekarang** dimulai dengan memilih profil: `all`, nomor, atau nama dipisah koma.
+Jika hanya satu profil, database di server ditampilkan bernomor: isi `all`, nomor atau nama
+dipisah koma (mis. `1,3`), atau kosongkan untuk memakai daftar database di profil. Jika
+beberapa profil, tiap profil mem-backup daftar database di profilnya, dan upload R2 cukup
+dijawab sekali.
 Menu **6** mengubah status auto backup banyak profil sekaligus (pilih `all`, nomor,
 atau nama dipisah koma, lalu `yes`/`no`) tanpa membuka form ubah profil.
 
