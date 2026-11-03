@@ -72,6 +72,14 @@ load_config() {
         if [[ "$value" =~ ^[0-9]+$ ]]; then printf -v "$key" '%s' "$value"; fi ;;
     esac
   done < "$ENV_FILE"
+  # Nama project Compose wajib huruf kecil (folder seperti /mnt/data/Databases/...).
+  # .env lama dari versi sebelumnya diperbaiki di tempat.
+  local cpn
+  cpn=$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$ENV_FILE" | tail -n1)
+  if [[ -n "$cpn" && ! "$cpn" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    cpn=$(printf '%s' "${cpn,,}" | tr -c 'a-z0-9_-' '-')
+    sed -i "s/^COMPOSE_PROJECT_NAME=.*/COMPOSE_PROJECT_NAME=$cpn/" "$ENV_FILE"
+  fi
   : "${MYSQL_IMAGE:=mysql:8.4}"
   : "${MYSQL_PORT:=3307}"
   : "${MYSQL_BIND:=127.0.0.1}"
@@ -314,7 +322,7 @@ MYSQL_BIND=$bind
 MYSQL_CONTAINER=$container
 MYSQL_UID=$my_uid
 MYSQL_GID=$my_gid
-COMPOSE_PROJECT_NAME=mym-${SCHED_ID}
+COMPOSE_PROJECT_NAME=mym-${SCHED_ID,,}
 EOF
   chmod 600 "$ENV_FILE"
 
